@@ -230,8 +230,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data.pop('pending_inbody_plan', None)
             db.save_nutrition_plan(user_id, pending_plan, is_base=True)
             await update.message.reply_text(
-                f"✅ *План обновлён по данным InBody!*\n\n"
-                f"🔥 {pending_plan['calories']} ккал\n"
+                f"✅ *План обновлён по данным InBody!*
+
+"
+                f"🔥 {pending_plan['calories']} ккал
+"
                 f"🥩 Белок: {pending_plan['protein']}г | 🧈 Жиры: {pending_plan['fat']}г | 🍞 Углеводы: {pending_plan['carbs']}г",
                 parse_mode="Markdown",
                 reply_markup=main_keyboard()
@@ -257,21 +260,30 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not history:
                 await update.message.reply_text("Нет сохранённых измерений InBody.", reply_markup=main_keyboard())
                 return
-            lines = ["📈 *История InBody:*\n"]
+            lines = ["📈 *История InBody:*
+"]
             for h in history:
                 lines.append(
                     f"📅 {h['date']}: {h.get('weight','?')}кг | "
                     f"💪 {h.get('muscle_mass','?')}кг | "
                     f"🧈 {h.get('fat_percent','?')}%"
                 )
-            await update.message.reply_text("\n".join(lines), parse_mode="Markdown", reply_markup=main_keyboard())
+            await update.message.reply_text("
+".join(lines), parse_mode="Markdown", reply_markup=main_keyboard())
             return
         elif "Вручную" in text:
             context.user_data['inbody_manual'] = {}
             await update.message.reply_text(
-                "Введи данные из отчёта InBody.\n\n"
-                "Напиши в формате (всё что знаешь, остальное пропусти):\n\n"
-                "_Вес: 85\nМышцы: 38\nЖир: 20%\nBMR: 1820_",
+                "Введи данные из отчёта InBody.
+
+"
+                "Напиши в формате (всё что знаешь, остальное пропусти):
+
+"
+                "_Вес: 85
+Мышцы: 38
+Жир: 20%
+BMR: 1820_",
                 parse_mode="Markdown",
                 reply_markup=ReplyKeyboardRemove()
             )
@@ -289,8 +301,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if not data:
             await update.message.reply_text(
-                "Не смог распознать данные. Попробуй написать например:\n" +
-"\n" +
+                "Не смог распознать данные. Попробуй написать например:
+"
                 "_Вес: 85, мышцы: 38, жир: 22%, BMR: 1820_",
                 parse_mode="Markdown"
             )
@@ -856,9 +868,9 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def inbody_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start InBody flow — offer photo or manual input"""
     await update.message.reply_text(
-        "📊 *Анализ InBody*"
+        "📊 *Анализ InBody*
 
-"\n"
+"
         "Как хочешь ввести данные?",
         parse_mode="Markdown",
         reply_markup=ReplyKeyboardMarkup([
@@ -914,28 +926,28 @@ async def _process_inbody(update: Update, context: ContextTypes.DEFAULT_TYPE, in
     bmr = kbju.get('bmr', '?')
 
     response = (
-        f"📊 *Данные InBody*"
+        f"📊 *Данные InBody*
 
-"\n"
-        f"⚖️ Вес: {weight} кг\n"
-"\n"
-        f"💪 Мышечная масса: {muscle} кг\n"
-"\n"
-        f"🧈 Жировая масса: {fat_mass} кг ({fat_pct}%)\n"
-"\n"
-        f"🔥 Базовый метаболизм: {bmr} ккал"
+"
+        f"⚖️ Вес: {weight} кг
+"
+        f"💪 Мышечная масса: {muscle} кг
+"
+        f"🧈 Жировая масса: {fat_mass} кг ({fat_pct}%)
+"
+        f"🔥 Базовый метаболизм: {bmr} ккал
 
-"\n"
-        f"🤖 {summary}"
+"
+        f"🤖 {summary}
 
-"\n"
-        f"*Рассчитанный план питания:*\n"
-"\n"
-        f"🔥 {kbju['calories']} ккал\n"
-"\n"
-        f"🥩 Белок: {kbju['protein']}г | 🧈 Жиры: {kbju['fat']}г | 🍞 Углеводы: {kbju['carbs']}г"
+"
+        f"*Рассчитанный план питания:*
+"
+        f"🔥 {kbju['calories']} ккал
+"
+        f"🥩 Белок: {kbju['protein']}г | 🧈 Жиры: {kbju['fat']}г | 🍞 Углеводы: {kbju['carbs']}г
 
-"\n"
+"
         f"Применить этот план?"
     )
 
@@ -1113,8 +1125,23 @@ def main():
         name="daily_summary"
     )
 
+    # Start mini-app web server
+    loop = asyncio.get_event_loop()
+    web_port = int(os.getenv("PORT", 8080))
+
+    async def run_all():
+        await start_web_server(db, port=web_port)
+        await app.initialize()
+        await app.start()
+        await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+        logger.info(f"Bot + WebApp started (port {web_port})")
+        await asyncio.Event().wait()
+
     logger.info("Bot started!")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    try:
+        loop.run_until_complete(run_all())
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":
