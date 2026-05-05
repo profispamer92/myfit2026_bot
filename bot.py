@@ -230,9 +230,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data.pop('pending_inbody_plan', None)
             db.save_nutrition_plan(user_id, pending_plan, is_base=True)
             await update.message.reply_text(
-f"✅ *План обновлён по данным InBody!*\n\n"
-                f"🔥 {pending_plan['calories']} ккал
-"
+                f"✅ *План обновлён по данным InBody!*\n\n"
+                f"🔥 {pending_plan['calories']} ккал\n"
                 f"🥩 Белок: {pending_plan['protein']}г | 🧈 Жиры: {pending_plan['fat']}г | 🍞 Углеводы: {pending_plan['carbs']}г",
                 parse_mode="Markdown",
                 reply_markup=main_keyboard()
