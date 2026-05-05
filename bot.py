@@ -230,11 +230,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data.pop('pending_inbody_plan', None)
             db.save_nutrition_plan(user_id, pending_plan, is_base=True)
             await update.message.reply_text(
-                f"✅ *План обновлён по данным InBody!*
-
-"
-                f"🔥 {pending_plan['calories']} ккал
-"
+                f"✅ *План обновлён по данным InBody!*\n\n"
+                f"🔥 {pending_plan['calories']} ккал\n"
                 f"🥩 Белок: {pending_plan['protein']}г | 🧈 Жиры: {pending_plan['fat']}г | 🍞 Углеводы: {pending_plan['carbs']}г",
                 parse_mode="Markdown",
                 reply_markup=main_keyboard()
@@ -260,30 +257,21 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not history:
                 await update.message.reply_text("Нет сохранённых измерений InBody.", reply_markup=main_keyboard())
                 return
-            lines = ["📈 *История InBody:*
-"]
+            lines = ["📈 *История InBody:*\n"]
             for h in history:
                 lines.append(
                     f"📅 {h['date']}: {h.get('weight','?')}кг | "
                     f"💪 {h.get('muscle_mass','?')}кг | "
                     f"🧈 {h.get('fat_percent','?')}%"
                 )
-            await update.message.reply_text("
-".join(lines), parse_mode="Markdown", reply_markup=main_keyboard())
+            await update.message.reply_text("\n".join(lines), parse_mode="Markdown", reply_markup=main_keyboard())
             return
         elif "Вручную" in text:
             context.user_data['inbody_manual'] = {}
             await update.message.reply_text(
-                "Введи данные из отчёта InBody.
-
-"
-                "Напиши в формате (всё что знаешь, остальное пропусти):
-
-"
-                "_Вес: 85
-Мышцы: 38
-Жир: 20%
-BMR: 1820_",
+                "Введи данные из отчёта InBody.\n\n"
+                "Напиши в формате (всё что знаешь, остальное пропусти):\n\n"
+                "_Вес: 85\nМышцы: 38\nЖир: 20%\nBMR: 1820_",
                 parse_mode="Markdown",
                 reply_markup=ReplyKeyboardRemove()
             )
@@ -301,8 +289,8 @@ BMR: 1820_",
 
         if not data:
             await update.message.reply_text(
-                "Не смог распознать данные. Попробуй написать например:
-"
+                "Не смог распознать данные. Попробуй написать например:\n" +
+"\n" +
                 "_Вес: 85, мышцы: 38, жир: 22%, BMR: 1820_",
                 parse_mode="Markdown"
             )
@@ -868,9 +856,9 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def inbody_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start InBody flow — offer photo or manual input"""
     await update.message.reply_text(
-        "📊 *Анализ InBody*
+        "📊 *Анализ InBody*"
 
-"
+"\n"
         "Как хочешь ввести данные?",
         parse_mode="Markdown",
         reply_markup=ReplyKeyboardMarkup([
@@ -926,28 +914,28 @@ async def _process_inbody(update: Update, context: ContextTypes.DEFAULT_TYPE, in
     bmr = kbju.get('bmr', '?')
 
     response = (
-        f"📊 *Данные InBody*
+        f"📊 *Данные InBody*"
 
-"
-        f"⚖️ Вес: {weight} кг
-"
-        f"💪 Мышечная масса: {muscle} кг
-"
-        f"🧈 Жировая масса: {fat_mass} кг ({fat_pct}%)
-"
-        f"🔥 Базовый метаболизм: {bmr} ккал
+"\n"
+        f"⚖️ Вес: {weight} кг\n"
+"\n"
+        f"💪 Мышечная масса: {muscle} кг\n"
+"\n"
+        f"🧈 Жировая масса: {fat_mass} кг ({fat_pct}%)\n"
+"\n"
+        f"🔥 Базовый метаболизм: {bmr} ккал"
 
-"
-        f"🤖 {summary}
+"\n"
+        f"🤖 {summary}"
 
-"
-        f"*Рассчитанный план питания:*
-"
-        f"🔥 {kbju['calories']} ккал
-"
-        f"🥩 Белок: {kbju['protein']}г | 🧈 Жиры: {kbju['fat']}г | 🍞 Углеводы: {kbju['carbs']}г
+"\n"
+        f"*Рассчитанный план питания:*\n"
+"\n"
+        f"🔥 {kbju['calories']} ккал\n"
+"\n"
+        f"🥩 Белок: {kbju['protein']}г | 🧈 Жиры: {kbju['fat']}г | 🍞 Углеводы: {kbju['carbs']}г"
 
-"
+"\n"
         f"Применить этот план?"
     )
 
