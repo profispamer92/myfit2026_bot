@@ -1,172 +1,236 @@
 """
-AI-driven onboarding.
-Claude leads the conversation, collects all needed data, returns JSON plan.
-No state machine — Claude decides what to ask and when it has enough info.
+Proactive AI monitor.
+Runs periodic checks and messages the user when it sees something important:
+- Weight plateau (2+ weeks no change)
+- Protein deficit (3 days in a row)
+- Calorie overrun (3 days in a row)
+- Weekly summary (every Sunday)
+- Monthly KBJU recalculation suggestion
 """
-import json
 import logging
-from telegram import Update, ReplyKeyboardRemove
-from telegram.ext import (
-    ContextTypes, ConversationHandler, CommandHandler,
-    MessageHandler, filters
-)
+from datetime import date, timedelta
+from telegram.ext import ContextTypes
 from database import Database
 from ai_handler import AIHandler
 
 logger = logging.getLogger(__name__)
 
-CHATTING = 1
 
-SYSTEM_PROMPT = """Ты опытный фитнес-тренер и нутрициолог. Твоя задача — познакомиться с новым клиентом и составить персональный план питания и тренировок.
+class ProactiveMonitor:
+    def __init__(self, db: Database, ai: AIHandler, bot):
+        self.db = db
+        self.ai = ai
+        self.bot = bot
 
-Веди естественный диалог на русском языке. Собери следующую информацию (можно в любом порядке):
-- Пол
-- Возраст  
-- Вес (кг)
-- Рост (см)
-- Процент жира (если знает — отлично, если нет — скажи что оценишь сам по другим данным)
-- Цель: сушка / набор / поддержание
-- Уровень активности вне тренировок (сидячий / лёгкий / умеренный / высокий)
-- Сколько раз в неделю тренируется и в какие дни
-- Примерное время тренировок
+    async def run_all_checks(self, context: ContextTypes.DEFAULT_TYPE = None):
+        """Called by JobQueue — runs all checks for all users"""
+        users = self.db.get_all_users()
+        for user in users:
+            user_id = user['user_id']
+            try:
+                await self._check_user(user_id)
+            except Exception as e:
+                logger.error(f"Proactive check failed for {user_id}: {e}")
 
-ПРАВИЛА ДИАЛОГА:
-- Не задавай все вопросы сразу — 1-2 за раз, живой разговор
-- Если написал несколько данных сразу — принимай все
-- Если не знает процент жира — не настаивай, оцени по возрасту/полу/весу/росту приближённо
-- Можешь делать промежуточные комментарии ("хороший результат для твоего возраста" и т.д.)
-- Когда собрал всё — предложи план и жди подтверждения
+    async def _check_user(self, user_id: int):
+        today = date.today()
+        plan = self.db.get_nutrition_plan(user_id)
+        if not plan:
+            return  # Not set up yet
 
-РАСЧЁТ КБЖУ:
-- Если есть процент жира → Katch-McArdle: BMR = 370 + 21.6 × (вес × (1 - жир/100))
-- Если нет → Миффлин-Сан Жеор: мужчины 10×вес + 6.25×рост - 5×возраст + 5, женщины -161
-- Коэффициент активности: сидячий 1.2, лёгкий 1.375, умеренный 1.55, высокий 1.725
-- Сушка: TDEE × 0.8, белок 2.2г/кг lean mass (или от веса если нет % жира)
-- Набор: TDEE × 1.1, белок 2.0г/кг
-- Поддержание: TDEE × 1.0, белок 1.8г/кг
-- Жиры: 25% от калорий, углеводы — остаток
+        # Don't spam — check what we already notified about
+        last_notifs = self.db.get_last_notifications(user_id)
 
-ПЛАН ТРЕНИРОВОК — предложи сплит исходя из кол-ва дней:
-- 2 дня: верх/низ
-- 3 дня: грудь+трицепс / спина+бицепс / ноги+плечи
-- 4 дня: грудь+трицепс / спина+бицепс / ноги / плечи+руки
-- 5+ дней: по группам мышц
+        # 1. Weekly summary — every Sunday
+        if today.weekday() == 6:  # Sunday
+            last_weekly = last_notifs.get('weekly_summary')
+            if last_weekly != today.isoformat():
+                await self._send_weekly_summary(user_id, plan)
+                self.db.save_notification(user_id, 'weekly_summary', today.isoformat())
+            return  # Only one notification per day
 
-Когда пользователь подтвердил план (сказал "да", "ок", "сохрани", "подходит", "давай") —
-верни ТОЛЬКО эту строку и ничего больше после неё:
-PLAN_JSON:{"calories":2200,"protein":180,"fat":65,"carbs":220,"schedule":{"monday":{"name":"Грудь и трицепс","time":"18:00"}},"profile":{"weight":82,"height":180,"age":28,"gender":"male","fat_percent":18,"goal":"cut","activity":"moderate"},"summary":"краткое резюме на 1 предложение"}"""
+        # 2. Weight plateau check
+        last_plateau = last_notifs.get('plateau_warning')
+        if last_plateau != today.isoformat():
+            plateau = self._check_plateau(user_id)
+            if plateau:
+                await self._send_plateau_warning(user_id, plateau, plan)
+                self.db.save_notification(user_id, 'plateau_warning', today.isoformat())
+                return
 
+        # 3. Low protein 3 days in a row
+        last_protein = last_notifs.get('low_protein')
+        days_since_protein = self._days_since(last_protein)
+        if days_since_protein is None or days_since_protein >= 3:
+            low_days = self._check_low_protein(user_id, plan, days=3)
+            if low_days >= 3:
+                await self._send_low_protein_warning(user_id, low_days, plan)
+                self.db.save_notification(user_id, 'low_protein', today.isoformat())
+                return
 
-def build_onboarding_handler(db: Database, ai: AIHandler):
+        # 4. Calorie overrun 3 days in a row
+        last_overrun = last_notifs.get('calorie_overrun')
+        days_since_overrun = self._days_since(last_overrun)
+        if days_since_overrun is None or days_since_overrun >= 3:
+            overrun_days = self._check_calorie_overrun(user_id, plan, days=3)
+            if overrun_days >= 3:
+                await self._send_overrun_warning(user_id, overrun_days, plan)
+                self.db.save_notification(user_id, 'calorie_overrun', today.isoformat())
+                return
 
-    async def ob_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        context.user_data['ob_history'] = []
-        await update.message.reply_text(
-            "Привет! Давай составим твой персональный план 💪\n\n"
-            "Расскажи о себе — начнём с главного: какая цель сейчас?\n"
-            "_Сушка, набор массы или поддержание формы?_",
-            parse_mode="Markdown",
-            reply_markup=ReplyKeyboardRemove()
-        )
-        return CHATTING
+        # 5. Monthly KBJU recalculation
+        last_recheck = last_notifs.get('kbju_recheck')
+        days_since_recheck = self._days_since(last_recheck)
+        if days_since_recheck is None or days_since_recheck >= 30:
+            await self._suggest_kbju_recheck(user_id, plan)
+            self.db.save_notification(user_id, 'kbju_recheck', today.isoformat())
 
-    async def ob_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.effective_user.id
-        text = update.message.text
-        history = context.user_data.get('ob_history', [])
-
-        history.append({"role": "user", "content": text})
-        await update.message.chat.send_action("typing")
-
+    def _days_since(self, date_str) -> int | None:
+        if not date_str:
+            return None
         try:
-            response = ai.client.messages.create(
-                model=ai.model,
-                max_tokens=900,
-                system=SYSTEM_PROMPT,
-                messages=history
-            )
-            reply = response.content[0].text.strip()
-        except Exception as e:
-            logger.error(f"Onboarding AI error: {e}")
-            await update.message.reply_text(
-                "Что-то пошло не так, попробуй ещё раз."
-            )
-            return CHATTING
+            d = date.fromisoformat(date_str)
+            return (date.today() - d).days
+        except Exception:
+            return None
 
-        history.append({"role": "assistant", "content": reply})
-        context.user_data['ob_history'] = history
+    def _check_plateau(self, user_id: int) -> dict | None:
+        """Returns plateau info if weight hasn't changed in 14+ days"""
+        weights = self.db.get_weight_history(user_id, days=21)
+        if len(weights) < 4:
+            return None
 
-        if "PLAN_JSON:" in reply:
-            return await _save_plan(update, context, reply, user_id)
+        recent = [w['weight'] for w in weights[:7]]    # last 7 days
+        older = [w['weight'] for w in weights[7:14]]   # 7-14 days ago
 
-        await update.message.reply_text(reply)
-        return CHATTING
+        if not recent or not older:
+            return None
 
-    async def _save_plan(update, context, reply, user_id):
-        try:
-            json_str = reply.split("PLAN_JSON:")[1].strip().split("\n")[0].strip()
-            plan_data = json.loads(json_str)
-        except Exception as e:
-            logger.error(f"Plan JSON parse error: {e}")
-            await update.message.reply_text(
-                "Не смог сохранить план автоматически. Напиши 'сохрани план' ещё раз."
-            )
-            return CHATTING
+        avg_recent = sum(recent) / len(recent)
+        avg_older = sum(older) / len(older)
+        change = avg_recent - avg_older
 
-        db.ensure_user(user_id)
+        # Less than 0.3kg change over 2 weeks = plateau
+        if abs(change) < 0.3:
+            return {
+                'avg_recent': round(avg_recent, 1),
+                'avg_older': round(avg_older, 1),
+                'change': round(change, 1),
+                'days': len(weights),
+            }
+        return None
 
-        nutrition = {k: plan_data[k] for k in ('calories','protein','fat','carbs')}
-        db.save_nutrition_plan(user_id, nutrition, is_base=True)
+    def _check_low_protein(self, user_id: int, plan: dict, days: int = 3) -> int:
+        """Returns number of consecutive days with protein below 85% of target"""
+        target = plan.get('protein', 0)
+        if not target:
+            return 0
+        stats = self.db.get_week_stats(user_id)
+        streak = 0
+        for day in stats[:days]:
+            if day['protein'] < target * 0.85:
+                streak += 1
+            else:
+                break
+        return streak
 
-        if plan_data.get('schedule'):
-            db.save_workout_schedule(user_id, plan_data['schedule'])
+    def _check_calorie_overrun(self, user_id: int, plan: dict, days: int = 3) -> int:
+        """Returns number of consecutive days over calories by 10%+"""
+        target = plan.get('calories', 0)
+        if not target:
+            return 0
+        stats = self.db.get_week_stats(user_id)
+        streak = 0
+        for day in stats[:days]:
+            if day['calories'] > target * 1.10:
+                streak += 1
+            else:
+                break
+        return streak
 
-        profile = plan_data.get('profile', {})
-        if profile:
-            db.save_user_profile(user_id, profile)
-            if profile.get('weight'):
-                db.log_weight(user_id, profile['weight'])
+    async def _send_plateau_warning(self, user_id: int, plateau: dict, plan: dict):
+        profile = self.db.get_user_profile(user_id)
+        suggestion = await self.ai.suggest_kbju_adjustment(
+            current_plan=plan,
+            plateau_info=plateau,
+            profile=profile,
+            reason="plateau"
+        )
+        text = (
+            f"📊 *Заметил кое-что важное*\n\n"
+            f"Вес практически не меняется уже 2 недели "
+            f"(было ~{plateau['avg_older']}кг, сейчас ~{plateau['avg_recent']}кг).\n\n"
+            f"🤖 *Предлагаю скорректировать план:*\n{suggestion['text']}\n\n"
+            f"Применить новый план?"
+        )
+        await self.bot.send_message(
+            chat_id=user_id,
+            text=text,
+            parse_mode="Markdown"
+        )
+        # Store pending plan change
+        self.db.save_pending_plan(user_id, suggestion['new_plan'], reason="plateau")
 
-        schedule = plan_data.get('schedule', {})
-        days_ru = {
-            "monday":"Пн","tuesday":"Вт","wednesday":"Ср",
-            "thursday":"Чт","friday":"Пт","saturday":"Сб","sunday":"Вс"
-        }
-        sched_lines = [
-            f"  {days_ru.get(d,d)}: {info['name']} в {info.get('time','?')}"
-            for d, info in schedule.items()
-        ]
+    async def _send_low_protein_warning(self, user_id: int, days: int, plan: dict):
+        text = (
+            f"⚠️ *{days} дня подряд не добираешь белок*\n\n"
+            f"Цель: {plan['protein']}г, а по факту значительно меньше.\n\n"
+            f"При сушке это критично — тело начинает разрушать мышцы.\n\n"
+            f"💡 Добавь в рацион: куриная грудка 150г (+35г белка), "
+            f"творог 0% 200г (+30г белка), яйца 3шт (+18г белка)."
+        )
+        await self.bot.send_message(chat_id=user_id, text=text, parse_mode="Markdown")
 
-        fat_str = f" | Жир: {profile.get('fat_percent')}%" if profile.get('fat_percent') else ""
-        summary = plan_data.get('summary', '')
+    async def _send_overrun_warning(self, user_id: int, days: int, plan: dict):
+        text = (
+            f"⚠️ *{days} дня подряд перебор по калориям*\n\n"
+            f"Цель: {plan['calories']} ккал — но последние дни выходишь за рамки.\n\n"
+            f"Это нормально бывает, но {days} дня подряд начинают влиять на прогресс. "
+            f"Посмотри на вечерние приёмы пищи — чаще всего перебор именно там 🌙"
+        )
+        await self.bot.send_message(chat_id=user_id, text=text, parse_mode="Markdown")
 
-        from bot import main_keyboard
-        await update.message.reply_text(
-            f"✅ *План сохранён!*\n\n"
-            f"👤 {profile.get('weight')}кг · {profile.get('height')}см · "
-            f"{profile.get('age')}лет{fat_str}\n\n"
-            f"🔥 {nutrition['calories']} ккал\n"
-            f"🥩 Белок: {nutrition['protein']}г · "
-            f"🧈 Жиры: {nutrition['fat']}г · "
-            f"🍞 Углеводы: {nutrition['carbs']}г\n\n"
-            f"💪 Тренировки:\n" + "\n".join(sched_lines) + "\n\n"
-            f"_{summary}_\n\n"
-            f"Готово! Кидай фото еды, пиши голосовым или текстом 💬",
-            parse_mode="Markdown",
-            reply_markup=main_keyboard()
+    async def _send_weekly_summary(self, user_id: int, plan: dict):
+        week_data = self.db.get_week_stats(user_id)
+        weights = self.db.get_weight_history(user_id, days=7)
+
+        if not week_data:
+            return
+
+        summary = await self.ai.generate_weekly_summary(
+            week_data=week_data,
+            plan=plan,
+            weights=weights
+        )
+        await self.bot.send_message(
+            chat_id=user_id,
+            text=f"📅 *Итоги недели*\n\n{summary}",
+            parse_mode="Markdown"
         )
 
-        context.user_data.pop('ob_history', None)
-        return ConversationHandler.END
+    async def _suggest_kbju_recheck(self, user_id: int, plan: dict):
+        weights = self.db.get_weight_history(user_id, days=30)
+        if not weights or len(weights) < 3:
+            return
 
-    return ConversationHandler(
-        entry_points=[
-            CommandHandler("setup", ob_start),
-            MessageHandler(filters.Regex("^🚀 Настроить план$"), ob_start),
-        ],
-        states={
-            CHATTING: [MessageHandler(filters.TEXT & ~filters.COMMAND, ob_chat)],
-        },
-        fallbacks=[CommandHandler("start", ob_start)],
-        allow_reentry=True,
-    )
+        first_weight = weights[-1]['weight']
+        last_weight = weights[0]['weight']
+        change = last_weight - first_weight
+
+        if abs(change) < 1.0:
+            return  # Not enough change to warrant recalculation
+
+        direction = "снизился" if change < 0 else "вырос"
+        text = (
+            f"📊 *Прошёл месяц — пора пересчитать план?*\n\n"
+            f"Вес {direction} на {abs(round(change, 1))}кг за последний месяц "
+            f"({first_weight}кг → {last_weight}кг).\n\n"
+            f"При таком изменении КБЖУ стоит пересчитать — иначе прогресс может замедлиться.\n\n"
+            f"Пересчитать план под новый вес?"
+        )
+        await self.bot.send_message(
+            chat_id=user_id,
+            text=text,
+            parse_mode="Markdown"
+        )
+        self.db.save_pending_plan(user_id, None, reason="weight_change")

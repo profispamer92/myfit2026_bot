@@ -1,785 +1,400 @@
-import anthropic
-import base64
-import json
-import os
-from typing import Optional
-from groq import Groq
-
-
-class AIHandler:
-    def __init__(self, api_key: str):
-        self.client = anthropic.Anthropic(api_key=api_key)
-        self.model = "claude-opus-4-5"
-        groq_key = os.getenv("GROQ_API_KEY")
-        self.openai = Groq(api_key=groq_key) if groq_key else None
-
-    def _parse_json(self, text: str) -> Optional[dict]:
-        try:
-            clean = text.strip().replace("```json", "").replace("```", "").strip()
-            return json.loads(clean)
-        except Exception:
-            return None
-
-    async def parse_nutrition_plan(self, text: str) -> Optional[dict]:
-        response = self.client.messages.create(
-            model=self.model,
-            max_tokens=300,
-            messages=[{
-                "role": "user",
-                "content": f"""Извлеки план питания из текста и верни ТОЛЬКО JSON без пояснений:
-{{
-  "calories": число,
-  "protein": число_в_граммах,
-  "fat": число_в_граммах,
-  "carbs": число_в_граммах
-}}
-
-Текст: {text}"""
-            }]
-        )
-        return self._parse_json(response.content[0].text)
-
-    async def parse_workout_schedule(self, text: str) -> Optional[dict]:
-        response = self.client.messages.create(
-            model=self.model,
-            max_tokens=500,
-            messages=[{
-                "role": "user",
-                "content": f"""Извлеки расписание тренировок и верни ТОЛЬКО JSON без пояснений.
-Используй английские названия дней: monday, tuesday, wednesday, thursday, friday, saturday, sunday.
-Формат:
-{{
-  "monday": {{"name": "Грудь и трицепс", "time": "18:00"}},
-  "wednesday": {{"name": "Спина и бицепс", "time": "18:00"}}
-}}
-Включай только тренировочные дни.
-
-Текст: {text}"""
-            }]
-        )
-        return self._parse_json(response.content[0].text)
-
-    async def analyze_food_photo(
-        self,
-        photo_bytes: bytes,
-        today_totals: Optional[dict] = None,
-        plan: Optional[dict] = None
-    ) -> Optional[dict]:
-        """
-        Analyzes any food photo:
-        - FatSecret screenshot → exact numbers
-        - Nutrition label on product → per-serving numbers + fit analysis
-        - Photo of actual food → estimated macros
-        Returns dict with nutrition data + optional advice if it's a label scan.
-        """
-        photo_b64 = base64.standard_b64encode(photo_bytes).decode("utf-8")
-
-        context = ""
-        if plan and today_totals:
-            cal_left = plan['calories'] - today_totals.get('calories', 0)
-            prot_left = plan['protein'] - today_totals.get('protein', 0)
-            fat_left = plan['fat'] - today_totals.get('fat', 0)
-            carbs_left = plan['carbs'] - today_totals.get('carbs', 0)
-            context = f"""
-Контекст пользователя:
-- Дневной план: {plan['calories']} ккал | Б:{plan['protein']}г Ж:{plan['fat']}г У:{plan['carbs']}г
-- Осталось сегодня: {cal_left} ккал | Б:{prot_left}г Ж:{fat_left}г У:{carbs_left}г
-"""
-
-        response = self.client.messages.create(
-            model=self.model,
-            max_tokens=700,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "image/jpeg",
-                            "data": photo_b64
-                        }
-                    },
-                    {
-                        "type": "text",
-                        "text": f"""Проанализируй фото и определи что это:
-
-1. СКРИН ИЗ FATSECRET — дневник питания или запись еды
-2. ЭТИКЕТКА / ТАБЛИЦА КБЖУ на продукте — пользователь планирует это съесть
-3. ФОТО ЕДЫ — реальная еда, нужно оценить состав
-
-{context}
-
-Верни ТОЛЬКО JSON без пояснений:
-{{
-  "photo_type": "fatsecret" | "label" | "food",
-  "description": "название продукта/блюда",
-  "serving_size": "размер порции если есть на этикетке, иначе null",
-  "calories": число на порцию,
-  "protein": число_г,
-  "fat": число_г,
-  "carbs": число_г,
-  "comment": "живой короткий комментарий тренера на русском — для фото еды: что видишь, оценка выбора (1-2 предложения, можно с лёгким юмором). Для FatSecret: короткая оценка дня. Для этикетки: null",
-  "fit_analysis": "если это этикетка И есть контекст плана — напиши 2-3 предложения: вписывается ли продукт в остаток дня, что можно подкорректировать. Если контекста нет или это не этикетка — null"
-}}
-
-Для этикетки бери цифры НА ПОРЦИЮ (или на 100г если порция не указана).
-Для FatSecret — суммарные цифры из скрина.
-Для фото еды — оцени примерно."""
-                    }
-                ]
-            }]
-        )
-        return self._parse_json(response.content[0].text)
-
-    async def classify_and_handle(
-        self,
-        text: str,
-        today_totals: Optional[dict],
-        plan: Optional[dict],
-        schedule: Optional[dict],
-        recent_logs: Optional[dict]
-    ) -> dict:
-        """
-        Classify user message and return appropriate response.
-        Types: meal | workout | weight | workout_reschedule | question
-        """
-        context = self._build_context(today_totals, plan, schedule, recent_logs)
-
-        system_prompt = f"""Ты персональный фитнес-ассистент. Отвечай только на русском языке.
-
-КОНТЕКСТ ПОЛЬЗОВАТЕЛЯ:
-{context}
-
-Твои задачи:
-1. Определить тип сообщения и вернуть JSON
-2. Для вопросов — дать умный совет с учётом контекста
-
-Возможные типы ответа:
-
-ЕДА: {{"type": "meal", "data": {{"description": "...", "calories": N, "protein": N, "fat": N, "carbs": N}}}}
-
-ТРЕНИРОВКА: {{"type": "workout", "data": {{"type": "название", "summary": "краткое описание", "exercises": [{{"name": "...", "sets": N, "reps": N, "weight": N}}]}}}}
-
-ВЕС/ЗАМЕРЫ: {{"type": "weight", "data": {{"weight": N}}}}
-
-СДВИГ ТРЕНИРОВКИ: {{"type": "workout_reschedule", "data": {{"new_time": "HH:MM", "day": "сегодня/завтра"}}}}
-
-ДОБАВИТЬ ТАБЛЕТКУ/БАД: {{"type": "add_supplement", "data": {{"name": "название", "dose": "дозировка", "timing": "before_meal|after_meal|with_meal|independent", "time_of_day": "HH:MM или null"}}}}
-
-ДОБАВИТЬ ЗАДАЧУ: {{"type": "add_task", "data": {{"title": "название задачи", "time_str": "HH:MM или null", "repeat": "daily|none"}}}}
-
-ДАННЫЕ ИЗ APPLE HEALTH (от Shortcuts) — утренняя или вечерняя сводка:
-{{"type": "health_sync", "data": {{
-  "sync_type": "morning" | "evening",
-  "steps": число_или_0,
-  "steps_date": "yesterday" | "today",
-  "calories_burned": число_или_0,
-  "active_minutes": число_или_0,
-  "weight": число_или_null,
-  "weight_measured_at": "время взвешивания строкой или null",
-  "workouts": [{{"type": "название", "duration_min": число, "calories": число}}],
-  "source": "shortcuts"
-}}}}
-Признаки утренней сводки: есть вес, упоминается "утро", "взвесился", "вчерашние шаги", время ~11:00.
-Признаки вечерней сводки: нет веса, упоминается "вечер", "сегодняшние шаги", время ~23:00.
-
-ВОПРОС/СОВЕТ: {{"type": "question", "answer": "твой развёрнутый ответ с учётом данных пользователя"}}
-
-Верни ТОЛЬКО JSON без пояснений."""
-
-        response = self.client.messages.create(
-            model=self.model,
-            max_tokens=800,
-            system=system_prompt,
-            messages=[{"role": "user", "content": text}]
-        )
-
-        result = self._parse_json(response.content[0].text)
-        if not result:
-            return {"type": "unknown"}
-        return result
-
-    async def recalculate_meal_timing(
-        self,
-        nutrition_plan: Optional[dict],
-        workout_time: str,
-        today_logs: Optional[dict]
-    ) -> str:
-        plan_info = ""
-        if nutrition_plan:
-            plan_info = f"Калории: {nutrition_plan['calories']} ккал, Б:{nutrition_plan['protein']}г Ж:{nutrition_plan['fat']}г У:{nutrition_plan['carbs']}г"
-
-        already_eaten = ""
-        if today_logs and today_logs.get('meals'):
-            meals = today_logs['meals']
-            already_eaten = "Уже съедено сегодня:\n" + "\n".join(
-                [f"• {m['time']} {m['description']} — {m['calories']} ккал" for m in meals[:5]]
-            )
-
-        response = self.client.messages.create(
-            model=self.model,
-            max_tokens=500,
-            messages=[{
-                "role": "user",
-                "content": f"""Тренировка сдвинута на {workout_time}.
-План питания: {plan_info}
-{already_eaten}
-
-Составь рекомендации по времени приёмов пищи с учётом новой тренировки.
-Укажи что и когда есть до и после тренировки.
-Отвечай кратко, по делу, на русском языке."""
-            }]
-        )
-        return response.content[0].text
-
-    async def suggest_kbju_adjustment(
-        self,
-        current_plan: dict,
-        plateau_info: dict,
-        profile: dict | None,
-        reason: str = "plateau"
-    ) -> dict:
-        """Suggest new KBJU plan based on plateau or weight change"""
-        profile_str = ""
-        if profile:
-            profile_str = f"Профиль: вес {profile.get('weight')}кг, цель: {profile.get('goal')}, активность: {profile.get('activity')}"
-
-        response = self.client.messages.create(
-            model=self.model,
-            max_tokens=600,
-            messages=[{
-                "role": "user",
-                "content": f"""Пользователь на сушке столкнулся с плато в весе.
-{profile_str}
-Текущий план: {current_plan['calories']} ккал, Б:{current_plan['protein']}г Ж:{current_plan['fat']}г У:{current_plan['carbs']}г
-Плато: вес не менялся ~{plateau_info.get('days', 14)} дней (было {plateau_info.get('avg_older')}кг, сейчас {plateau_info.get('avg_recent')}кг)
-
-Предложи скорректированный план. Верни JSON:
-{{
-  "text": "объяснение на русском — что предлагаешь и почему (2-3 предложения)",
-  "new_plan": {{
-    "calories": число,
-    "protein": число,
-    "fat": число,
-    "carbs": число
-  }}
-}}"""
-            }]
-        )
-        result = self._parse_json(response.content[0].text)
-        if not result:
-            # fallback
-            new_cal = current_plan['calories'] - 150
-            return {
-                "text": f"Предлагаю снизить калории на 150 ккал (до {new_cal} ккал) за счёт углеводов. Белок оставляем прежним для сохранения мышц.",
-                "new_plan": {
-                    "calories": new_cal,
-                    "protein": current_plan['protein'],
-                    "fat": current_plan['fat'],
-                    "carbs": current_plan['carbs'] - round(150/4),
-                }
-            }
-        return result
-
-    async def generate_weekly_summary(
-        self,
-        week_data: list,
-        plan: dict,
-        weights: list
-    ) -> str:
-        """Generate weekly summary with AI commentary"""
-        avg_cal = round(sum(d['calories'] for d in week_data) / len(week_data)) if week_data else 0
-        avg_prot = round(sum(d['protein'] for d in week_data) / len(week_data)) if week_data else 0
-        days_logged = len(week_data)
-
-        weight_change = ""
-        if len(weights) >= 2:
-            diff = round(weights[0]['weight'] - weights[-1]['weight'], 1)
-            weight_change = f"Вес: {weights[-1]['weight']}кг → {weights[0]['weight']}кг (изменение: {'+' if diff>0 else ''}{diff}кг)"
-
-        response = self.client.messages.create(
-            model=self.model,
-            max_tokens=400,
-            messages=[{
-                "role": "user",
-                "content": f"""Напиши краткий итог недели для пользователя на сушке. Тон: дружелюбный тренер.
-
-Данные:
-- Дней с записями: {days_logged}/7
-- Средние калории: {avg_cal} ккал (план: {plan['calories']} ккал)
-- Средний белок: {avg_prot}г (план: {plan['protein']}г)
-- {weight_change}
-
-Напиши 3-4 предложения: что хорошо, что подтянуть, мотивация. Только текст, без JSON."""
-            }]
-        )
-        return response.content[0].text
-
-    async def check_product_fit(
-        self,
-        product_text: str,
-        today_totals: dict | None,
-        plan: dict | None
-    ) -> str:
-        """Answer 'can I eat X?' questions"""
-        context = ""
-        if plan and today_totals:
-            cal_left = plan['calories'] - today_totals.get('calories', 0)
-            prot_left = plan['protein'] - today_totals.get('protein', 0)
-            fat_left = plan['fat'] - today_totals.get('fat', 0)
-            carbs_left = plan['carbs'] - today_totals.get('carbs', 0)
-            context = f"Осталось сегодня: {cal_left} ккал | Б:{prot_left}г Ж:{fat_left}г У:{carbs_left}г"
-
-        response = self.client.messages.create(
-            model=self.model,
-            max_tokens=300,
-            messages=[{
-                "role": "user",
-                "content": f"""Пользователь спрашивает: можно ли съесть "{product_text}"?
-{context}
-
-Ответь коротко на русском:
-1. Примерные КБЖУ этого продукта
-2. Вписывается ли в остаток дня
-3. Если нет — что можно убрать чтобы вписался
-
-Тон: дружелюбный тренер, 2-4 предложения."""
-            }]
-        )
-        return response.content[0].text
-
-
-    async def suggest_meal(
-        self,
-        meal_type: str,
-        today_totals: dict | None,
-        plan: dict | None,
-        meal_history: list,
-    ) -> str:
-        """Suggest meal options based on user's eating history and today's remaining macros"""
-
-        # Build remaining macros context
-        remaining = ""
-        if plan and today_totals:
-            cal_left = plan['calories'] - today_totals.get('calories', 0)
-            prot_left = plan['protein'] - today_totals.get('protein', 0)
-            fat_left = plan['fat'] - today_totals.get('fat', 0)
-            carbs_left = plan['carbs'] - today_totals.get('carbs', 0)
-            remaining = f"Осталось на сегодня: {cal_left} ккал | Б:{prot_left}г Ж:{fat_left}г У:{carbs_left}г"
-
-        # Extract frequent foods from history
-        food_freq = {}
-        for meal in meal_history:
-            desc = meal.get('description', '').strip()
-            if desc and len(desc) > 2:
-                food_freq[desc] = food_freq.get(desc, 0) + 1
-
-        # Top 15 most frequent
-        top_foods = sorted(food_freq.items(), key=lambda x: -x[1])[:15]
-        history_str = ", ".join([f"{name} (×{cnt})" for name, cnt in top_foods]) if top_foods else "история пока пуста"
-
-        response = self.client.messages.create(
-            model=self.model,
-            max_tokens=400,
-            messages=[{
-                "role": "user",
-                "content": f"""Пользователь на сушке спрашивает что поесть на {meal_type}.
-
-{remaining}
-
-Продукты и блюда которые он обычно ест (из истории за 30 дней):
-{history_str}
-
-Предложи 2-3 конкретных варианта ТОЛЬКО из его привычных продуктов.
-Для каждого варианта укажи примерные КБЖУ и почему он подходит под остаток.
-Если ничего не вписывается — скажи честно и предложи уменьшить порцию.
-Тон: дружелюбный тренер, коротко и по делу. Только текст, без JSON."""
-            }]
-        )
-        return response.content[0].text
-
-
-    async def transcribe_voice(self, audio_path: str) -> str | None:
-        """Transcribe voice message using OpenAI Whisper"""
-        if not self.openai:
-            return None
-        try:
-            with open(audio_path, "rb") as audio_file:
-                result = self.openai.audio.transcriptions.create(
-                    model="whisper-1",
-                    file=audio_file,
-                    language="ru"
-                )
-            return result.text.strip()
-        except Exception as e:
-            import logging
-            logging.getLogger(__name__).error(f"Whisper error: {e}")
-            return None
-
-
-    async def generate_daily_summary(
-        self,
-        today_meals: list,
-        today_totals: dict,
-        plan: dict,
-        activity: dict | None,
-        had_workout: bool,
-        weight_today: float | None,
-    ) -> str:
-        """Evening daily summary — friendly coach tone"""
-        meals_str = "\n".join([
-            f"  • {m['time']} {m['description']} — {m['calories']} ккал"
-            for m in today_meals
-        ]) or "  Записей нет"
-
-        cal_diff = today_totals.get('calories', 0) - plan.get('calories', 0)
-        prot_diff = today_totals.get('protein', 0) - plan.get('protein', 0)
-        steps = activity.get('steps', 0) if activity else 0
-        burned = activity.get('calories_burned', 0) if activity else 0
-
-        response = self.client.messages.create(
-            model=self.model,
-            max_tokens=450,
-            messages=[{"role": "user", "content": f"""Напиши итог дня для пользователя на сушке.
-Тон: тренер — честный, краткий, с лёгким юмором если день был хорошим.
-
-ПИТАНИЕ:
-{meals_str}
-Итого: {today_totals.get('calories', 0)} ккал (план {plan.get('calories', 0)}, {'перебор' if cal_diff > 0 else 'дефицит'} {abs(cal_diff)} ккал)
-Белок: {today_totals.get('protein', 0)}г из {plan.get('protein', 0)}г ({'✅' if prot_diff >= -10 else '❌ не добрал'})
-
-АКТИВНОСТЬ:
-{'Была тренировка' if had_workout else 'Тренировки не было'}
-Шаги: {steps:,} | Сожжено: {burned} ккал
-
-{'Вес сегодня: ' + str(weight_today) + ' кг' if weight_today else ''}
-
-Напиши 3-5 предложений: оценка дня, что молодец, что подтянуть завтра. Только текст."""}]
-        )
-        return response.content[0].text
-
-    async def generate_text_analytics(
-        self,
-        period: str,
-        week_data: list,
-        month_data: list,
-        plan: dict,
-        weight_history: list,
-        activity_data: list,
-    ) -> str:
-        """Text analytics with correlations, best/worst days, averages"""
-        def avg(lst, key):
-            vals = [d[key] for d in lst if d.get(key, 0) > 0]
-            return round(sum(vals) / len(vals)) if vals else 0
-
-        data = month_data if period == 'month' else week_data
-        label = "месяц" if period == 'month' else "неделю"
-
-        avg_cal = avg(data, 'calories')
-        avg_prot = avg(data, 'protein')
-        best_day = max(data, key=lambda d: d.get('protein', 0), default=None)
-        worst_day = max(data, key=lambda d: abs(d.get('calories', 0) - plan.get('calories', 1)), default=None)
-
-        weight_change = ""
-        if len(weight_history) >= 2:
-            diff = round(weight_history[0]['weight'] - weight_history[-1]['weight'], 1)
-            weight_change = f"Вес изменился на {'+' if diff > 0 else ''}{diff} кг"
-
-        avg_steps = avg(activity_data, 'steps') if activity_data else 0
-
-        response = self.client.messages.create(
-            model=self.model,
-            max_tokens=600,
-            messages=[{"role": "user", "content": f"""Напиши аналитику за {label} для пользователя на сушке.
-
-ДАННЫЕ:
-- Средние калории: {avg_cal} ккал (план: {plan.get('calories', 0)} ккал)
-- Средний белок: {avg_prot}г (план: {plan.get('protein', 0)}г)
-- Лучший день по белку: {best_day['date'] if best_day else 'н/д'} ({best_day.get('protein', 0) if best_day else 0}г)
-- День с наибольшим отклонением: {worst_day['date'] if worst_day else 'н/д'}
-- {weight_change}
-- Средние шаги: {avg_steps:,}/день
-
-Напиши структурированный анализ:
-1. Общая оценка периода
-2. Что работает хорошо
-3. Главная проблема и конкретный совет
-4. Корреляции — что замечаешь между данными
-5. Цель на следующий период
-
-Только текст, без JSON. 150-200 слов."""}]
-        )
-        return response.content[0].text
-
-
-    async def analyze_inbody_photo(self, photo_bytes: bytes) -> dict | None:
-        """Extract InBody report data from photo"""
-        photo_b64 = base64.standard_b64encode(photo_bytes).decode("utf-8")
-        response = self.client.messages.create(
-            model=self.model,
-            max_tokens=500,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {"type": "base64", "media_type": "image/jpeg", "data": photo_b64}
-                    },
-                    {
-                        "type": "text",
-                        "text": """Это отчёт InBody (анализ состава тела).
-Извлеки все доступные данные и верни ТОЛЬКО JSON без пояснений:
-{
-  "weight": число или null,
-  "muscle_mass": число_кг или null,
-  "fat_mass": число_кг или null,
-  "fat_percent": число_% или null,
-  "bmr": число_ккал или null,
-  "body_water": число_кг или null,
-  "visceral_fat": число или null,
-  "found": true если данные найдены, false если это не InBody
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>FitDay</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=Unbounded:wght@400;600;800&family=Golos+Text:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #0e0e12; --card: #16161e; --card2: #1e1e2a; --border: #2a2a3a;
+    --accent: #c8f135; --accent2: #5b8bff; --accent3: #ff6b6b; --accent4: #ffb347;
+    --text: #f0f0f8; --muted: #7070a0; --done: #1a1a22; --done-text: #404060;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+  html, body { height: 100%; background: var(--bg); color: var(--text); font-family: 'Golos Text', sans-serif; overflow-x: hidden; }
+
+  .header { position: sticky; top: 0; z-index: 100; background: var(--bg); padding: 14px 16px 10px; border-bottom: 1px solid var(--border); }
+  .header-top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+  .logo { font-family: 'Unbounded', sans-serif; font-size: 18px; font-weight: 800; color: var(--accent); }
+  .date-pill { background: var(--card2); border: 1px solid var(--border); padding: 5px 12px; border-radius: 20px; font-size: 12px; color: var(--muted); }
+
+  .kbju-row { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 8px; }
+  .kbju-cal { font-family: 'Unbounded', sans-serif; font-size: 24px; font-weight: 800; }
+  .kbju-cal small { font-family: 'Golos Text', sans-serif; font-size: 12px; color: var(--muted); font-weight: 400; }
+  .kbju-left { font-size: 12px; font-weight: 700; }
+  .macro-bars { display: flex; gap: 8px; }
+  .macro-bar-wrap { flex: 1; }
+  .macro-label { font-size: 10px; color: var(--muted); margin-bottom: 3px; display: flex; justify-content: space-between; }
+  .macro-label b { color: var(--text); }
+  .bar-track { height: 5px; background: var(--border); border-radius: 3px; overflow: hidden; }
+  .bar-fill { height: 100%; border-radius: 3px; transition: width 0.5s cubic-bezier(.4,0,.2,1); }
+  .bar-p { background: var(--accent2); } .bar-f { background: var(--accent4); } .bar-c { background: var(--accent); }
+  .bar-over { background: var(--accent3) !important; }
+
+  .scroll { padding: 12px 16px 100px; }
+  .time-group { margin-bottom: 18px; }
+  .time-label { font-size: 10px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: 1.5px; margin-bottom: 7px; padding-left: 2px; }
+
+  .item {
+    background: var(--card); border: 1px solid var(--border); border-radius: 16px;
+    padding: 12px 14px; margin-bottom: 7px;
+    display: flex; align-items: center; gap: 12px;
+    cursor: pointer; transition: opacity 0.2s; position: relative; overflow: hidden;
+  }
+  .item::before { content:''; position:absolute; left:0; top:0; bottom:0; width:3px; border-radius:3px 0 0 3px; }
+  .item.type-meal::before { background: var(--accent); }
+  .item.type-pill::before { background: var(--accent2); }
+  .item.type-task::before { background: var(--accent4); }
+  .item.type-workout::before { background: var(--accent3); }
+  .item.done { opacity: 0.45; }
+  .item.done .item-name { text-decoration: line-through; color: var(--done-text); }
+  .item-icon { width: 36px; height: 36px; border-radius: 10px; display: flex; align-items: center; justify-content: center; font-size: 18px; flex-shrink: 0; }
+  .type-meal .item-icon { background: rgba(200,241,53,.12); }
+  .type-pill .item-icon { background: rgba(91,139,255,.12); }
+  .type-task .item-icon { background: rgba(255,179,71,.12); }
+  .type-workout .item-icon { background: rgba(255,107,107,.12); }
+  .item-body { flex: 1; min-width: 0; }
+  .item-name { font-size: 14px; font-weight: 600; margin-bottom: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .item-meta { font-size: 12px; color: var(--muted); }
+  .item-check { width: 24px; height: 24px; flex-shrink: 0; border-radius: 8px; border: 2px solid var(--border); display: flex; align-items: center; justify-content: center; font-size: 13px; transition: all 0.2s; }
+  .item.done .item-check { background: var(--accent); border-color: var(--accent); color: #000; font-weight: 700; }
+
+  .allday-block { background: var(--card2); border: 1px solid var(--border); border-radius: 16px; padding: 10px 14px; margin-bottom: 16px; }
+  .allday-title { font-size: 10px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: 1.5px; margin-bottom: 8px; }
+  .allday-row { display: flex; align-items: center; gap: 10px; padding: 7px 0; border-bottom: 1px solid var(--border); cursor: pointer; }
+  .allday-row:last-child { border-bottom: none; }
+  .allday-check { width: 20px; height: 20px; border-radius: 6px; border: 2px solid var(--border); display: flex; align-items: center; justify-content: center; font-size: 11px; flex-shrink: 0; transition: all 0.2s; }
+  .allday-row.done .allday-check { background: var(--accent); border-color: var(--accent); color: #000; font-weight: 700; }
+  .allday-row.done .allday-name { text-decoration: line-through; color: var(--done-text); }
+  .allday-name { font-size: 13px; font-weight: 500; flex: 1; }
+  .allday-tag { font-size: 10px; padding: 2px 8px; border-radius: 8px; font-weight: 700; }
+  .tag-pill { background: rgba(91,139,255,.15); color: var(--accent2); }
+  .tag-task { background: rgba(255,179,71,.15); color: var(--accent4); }
+
+  .timing-badge { font-size: 10px; padding: 1px 6px; border-radius: 6px; font-weight: 700; margin-left: 5px; vertical-align: middle; }
+  .t-before { background: rgba(255,107,107,.15); color: var(--accent3); }
+  .t-after { background: rgba(200,241,53,.12); color: var(--accent); }
+  .t-any { background: rgba(91,139,255,.12); color: var(--accent2); }
+
+  .fab { position: fixed; bottom: 24px; right: 20px; width: 54px; height: 54px; background: var(--accent); color: #000; border: none; border-radius: 16px; font-size: 26px; cursor: pointer; display: flex; align-items: center; justify-content: center; box-shadow: 0 4px 24px rgba(200,241,53,.35); z-index: 200; transition: transform .15s; }
+  .fab:active { transform: scale(.9); }
+
+  .empty { text-align: center; padding: 60px 24px; color: var(--muted); }
+  .empty-icon { font-size: 52px; margin-bottom: 12px; }
+  .empty-text { font-size: 14px; line-height: 1.7; }
+
+  .overlay { position: fixed; inset: 0; background: rgba(0,0,0,.75); z-index: 300; opacity: 0; pointer-events: none; transition: opacity .25s; }
+  .overlay.open { opacity: 1; pointer-events: all; }
+  .sheet { position: fixed; bottom: 0; left: 0; right: 0; background: var(--card); border-radius: 22px 22px 0 0; padding: 0 16px 36px; z-index: 400; transform: translateY(100%); transition: transform .3s cubic-bezier(.4,0,.2,1); max-height: 88vh; overflow-y: auto; }
+  .sheet.open { transform: translateY(0); }
+  .sheet-handle { width: 36px; height: 4px; background: var(--border); border-radius: 2px; margin: 12px auto 18px; }
+  .sheet-title { font-family: 'Unbounded', sans-serif; font-size: 15px; font-weight: 700; margin-bottom: 18px; }
+
+  .type-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 4px; }
+  .type-btn { background: var(--card2); border: 2px solid var(--border); border-radius: 16px; padding: 16px 10px; text-align: center; cursor: pointer; transition: all .2s; }
+  .type-btn.sel { border-color: var(--accent); background: rgba(200,241,53,.08); }
+  .type-btn-icon { font-size: 26px; margin-bottom: 6px; }
+  .type-btn-label { font-size: 12px; font-weight: 600; color: var(--muted); }
+  .type-btn.sel .type-btn-label { color: var(--accent); }
+
+  .form-group { margin-bottom: 14px; }
+  .form-label { font-size: 11px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 5px; display: block; }
+  .form-input { width: 100%; background: var(--card2); border: 1px solid var(--border); border-radius: 12px; padding: 12px 14px; color: var(--text); font-family: 'Golos Text', sans-serif; font-size: 15px; outline: none; transition: border-color .2s; }
+  .form-input:focus { border-color: var(--accent); }
+  .form-row { display: flex; gap: 10px; }
+  .form-row .form-group { flex: 1; }
+
+  .toggle-row { display: flex; gap: 8px; margin-bottom: 14px; }
+  .toggle-btn { flex: 1; padding: 10px 6px; border-radius: 10px; background: var(--card2); border: 1px solid var(--border); color: var(--muted); font-size: 12px; font-weight: 600; cursor: pointer; text-align: center; transition: all .2s; }
+  .toggle-btn.on { background: rgba(200,241,53,.1); border-color: var(--accent); color: var(--accent); }
+
+  .submit-btn { width: 100%; padding: 16px; background: var(--accent); color: #000; border: none; border-radius: 14px; font-family: 'Unbounded', sans-serif; font-size: 13px; font-weight: 700; cursor: pointer; margin-top: 6px; transition: opacity .2s; }
+  .submit-btn:active { opacity: .8; }
+
+  .toast { position: fixed; top: 76px; left: 50%; transform: translateX(-50%) translateY(-8px); background: var(--card2); border: 1px solid var(--border); padding: 9px 18px; border-radius: 12px; font-size: 13px; font-weight: 600; opacity: 0; pointer-events: none; transition: all .25s; z-index: 500; white-space: nowrap; }
+  .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="header-top">
+    <div class="logo">FitDay</div>
+    <div class="date-pill" id="dateLabel">—</div>
+  </div>
+  <div class="kbju-row">
+    <div class="kbju-cal" id="calEaten">0 <small>/ <span id="calPlan">—</span> ккал</small></div>
+    <div class="kbju-left" id="calLeft" style="color:var(--accent)">— осталось</div>
+  </div>
+  <div class="macro-bars">
+    <div class="macro-bar-wrap">
+      <div class="macro-label">Белок <b id="pVal">0</b>г</div>
+      <div class="bar-track"><div class="bar-fill bar-p" id="pBar" style="width:0%"></div></div>
+    </div>
+    <div class="macro-bar-wrap">
+      <div class="macro-label">Жиры <b id="fVal">0</b>г</div>
+      <div class="bar-track"><div class="bar-fill bar-f" id="fBar" style="width:0%"></div></div>
+    </div>
+    <div class="macro-bar-wrap">
+      <div class="macro-label">Углеводы <b id="cVal">0</b>г</div>
+      <div class="bar-track"><div class="bar-fill bar-c" id="cBar" style="width:0%"></div></div>
+    </div>
+  </div>
+</div>
+
+<div class="scroll" id="mainScroll">
+  <div class="empty" id="emptyState">
+    <div class="empty-icon">📋</div>
+    <div class="empty-text">План на сегодня пуст<br><span style="font-size:13px">Нажми + чтобы добавить<br>или напиши боту</span></div>
+  </div>
+  <div id="alldaySection"></div>
+  <div id="timelineSection"></div>
+</div>
+
+<button class="fab" id="fabBtn">+</button>
+
+<div class="overlay" id="overlay"></div>
+<div class="sheet" id="sheet">
+  <div class="sheet-handle"></div>
+  <div class="sheet-title" id="sheetTitle">Добавить в план</div>
+
+  <div id="typePicker">
+    <div class="type-grid">
+      <div class="type-btn" data-t="meal" onclick="pickType('meal')"><div class="type-btn-icon">🍽</div><div class="type-btn-label">Еда</div></div>
+      <div class="type-btn" data-t="pill" onclick="pickType('pill')"><div class="type-btn-icon">💊</div><div class="type-btn-label">Таблетка / БАД</div></div>
+      <div class="type-btn" data-t="workout" onclick="pickType('workout')"><div class="type-btn-icon">💪</div><div class="type-btn-label">Тренировка</div></div>
+      <div class="type-btn" data-t="task" onclick="pickType('task')"><div class="type-btn-icon">✅</div><div class="type-btn-label">Задача</div></div>
+    </div>
+  </div>
+
+  <div id="itemForm" style="display:none">
+    <div class="form-group">
+      <label class="form-label" id="nameLabel">Название</label>
+      <input class="form-input" id="nameInput" placeholder="">
+    </div>
+    <div id="pillExtra" style="display:none">
+      <div class="form-group">
+        <label class="form-label">Дозировка</label>
+        <input class="form-input" id="doseInput" placeholder="Например: 2 капсулы 1000мг">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Приём</label>
+        <div class="toggle-row">
+          <div class="toggle-btn on" data-timing="after" onclick="pickTiming(this)">После еды</div>
+          <div class="toggle-btn" data-timing="before" onclick="pickTiming(this)">До еды</div>
+          <div class="toggle-btn" data-timing="any" onclick="pickTiming(this)">Независимо</div>
+        </div>
+      </div>
+    </div>
+    <div id="mealExtra" style="display:none">
+      <div class="form-row">
+        <div class="form-group"><label class="form-label">Калории</label><input class="form-input" id="calIn" type="number" placeholder="ккал"></div>
+        <div class="form-group"><label class="form-label">Белок</label><input class="form-input" id="protIn" type="number" placeholder="г"></div>
+      </div>
+    </div>
+    <div class="form-group">
+      <label class="form-label">Время</label>
+      <div class="toggle-row" style="margin-bottom:8px">
+        <div class="toggle-btn on" onclick="pickTimeMode(this,'time')">Конкретное</div>
+        <div class="toggle-btn" onclick="pickTimeMode(this,'allday')">На весь день</div>
+      </div>
+      <input class="form-input" id="timeIn" type="time" value="08:00">
+    </div>
+    <div class="form-group" id="noteGroup">
+      <label class="form-label">Заметка</label>
+      <input class="form-input" id="noteIn" placeholder="Опционально">
+    </div>
+    <button class="submit-btn" onclick="addItem()">Добавить ✓</button>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const tg = window.Telegram?.WebApp;
+if (tg) { tg.ready(); tg.expand(); }
+
+let S = {
+  plan: null, eaten: {calories:0,protein:0,fat:0,carbs:0},
+  items: [], type: null, timing: 'after', timeMode: 'time'
+};
+
+async function load() {
+  const uid = tg?.initDataUnsafe?.user?.id;
+  if (uid) {
+    try {
+      const r = await fetch(`/webapp/data?user_id=${uid}`);
+      const d = await r.json();
+      S.plan = d.plan; S.eaten = d.eaten||{calories:0,protein:0,fat:0,carbs:0}; S.items = d.items||[];
+      return render();
+    } catch(e) {}
+  }
+  // Demo
+  S.plan = {calories:2400,protein:180,fat:70,carbs:240};
+  S.eaten = {calories:1380,protein:105,fat:45,carbs:155};
+  S.items = [
+    {id:1,type:'task',name:'Взвеситься',time:'08:00',allday:false,done:true,meta:''},
+    {id:2,type:'pill',name:'Омега-3',time:'08:30',allday:false,done:true,meta:'2 капсулы',timing:'after'},
+    {id:3,type:'meal',name:'Завтрак — овсянка + яйца',time:'09:00',allday:false,done:true,meta:'480 ккал · Б:34г',calories:480,protein:34},
+    {id:4,type:'pill',name:'Витамин D3',time:'13:00',allday:false,done:false,meta:'5000 МЕ',timing:'after'},
+    {id:5,type:'meal',name:'Обед — курица + гречка',time:'13:30',allday:false,done:false,meta:'580 ккал · Б:52г',calories:580,protein:52},
+    {id:6,type:'workout',name:'Спина и бицепс',time:'18:00',allday:false,done:false,meta:'~60 мин'},
+    {id:7,type:'meal',name:'Ужин — творог + огурец',time:'20:30',allday:false,done:false,meta:'280 ккал · Б:38г',calories:280,protein:38},
+    {id:8,type:'task',name:'Выпить 2л воды',time:null,allday:true,done:false,meta:''},
+    {id:9,type:'pill',name:'Магний Б6',time:null,allday:true,done:false,meta:'400мг перед сном',timing:'before'},
+  ];
+  render();
 }
-Все числа без единиц измерения, только цифры."""
-                    }
-                ]
-            }]
-        )
-        result = self._parse_json(response.content[0].text)
-        if result and result.get('found'):
-            return result
-        return None
 
-    async def calculate_kbju_from_inbody(
-        self,
-        inbody: dict,
-        goal: str,
-        activity: str,
-    ) -> dict:
-        """Calculate precise KBJU from InBody data"""
-        ACTIVITY_MULTIPLIERS = {
-            "minimal": 1.2, "light": 1.375, "moderate": 1.55, "active": 1.725
-        }
+function render() { updateKBJU(); renderAll(); }
 
-        # Katch-McArdle formula — more accurate when we know lean mass
-        lean_mass = inbody.get('muscle_mass')
-        weight = inbody.get('weight')
-        fat_percent = inbody.get('fat_percent')
-        bmr_from_report = inbody.get('bmr')
+function updateKBJU() {
+  if (!S.plan) return;
+  const p=S.plan, e=S.eaten;
+  document.getElementById('calEaten').innerHTML = `${e.calories} <small>/ <span id="calPlan">${p.calories}</span> ккал</small>`;
+  const left = p.calories - e.calories;
+  const el = document.getElementById('calLeft');
+  el.textContent = left>=0 ? `${left} осталось` : `${Math.abs(left)} перебор`;
+  el.style.color = left>=0 ? 'var(--accent)' : 'var(--accent3)';
+  document.getElementById('pVal').textContent = e.protein;
+  document.getElementById('fVal').textContent = e.fat;
+  document.getElementById('cVal').textContent = e.carbs;
+  bar('pBar',e.protein,p.protein); bar('fBar',e.fat,p.fat); bar('cBar',e.carbs,p.carbs);
+}
 
-        if bmr_from_report:
-            bmr = bmr_from_report
-        elif lean_mass:
-            bmr = 370 + 21.6 * lean_mass  # Katch-McArdle
-        elif weight and fat_percent:
-            lean = weight * (1 - fat_percent / 100)
-            bmr = 370 + 21.6 * lean
-        else:
-            bmr = 1800  # fallback
+function bar(id,v,m) {
+  const el=document.getElementById(id);
+  el.style.width=Math.min((v/m)*100,100)+'%';
+  el.classList.toggle('bar-over', v>m*1.05);
+}
 
-        multiplier = ACTIVITY_MULTIPLIERS.get(activity, 1.55)
-        tdee = bmr * multiplier
+function renderAll() {
+  const allday = S.items.filter(i=>i.allday);
+  const timed = S.items.filter(i=>!i.allday).sort((a,b)=>(a.time||'').localeCompare(b.time||''));
+  document.getElementById('emptyState').style.display = S.items.length?'none':'block';
 
-        if goal == 'cut':
-            calories = round(tdee * 0.8)
-            protein_per_kg = 2.4  # higher on cut to preserve muscle
-        elif goal == 'bulk':
-            calories = round(tdee * 1.1)
-            protein_per_kg = 2.0
-        else:
-            calories = round(tdee)
-            protein_per_kg = 1.8
+  // Allday
+  const adSec = document.getElementById('alldaySection');
+  adSec.innerHTML = allday.length ? `<div class="allday-block">
+    <div class="allday-title">На весь день</div>
+    ${allday.map(i=>`<div class="allday-row ${i.done?'done':''}" onclick="toggle(${i.id})">
+      <div class="allday-check">${i.done?'✓':''}</div>
+      <div class="allday-name">${i.name}${i.meta?` <span style="color:var(--muted);font-size:11px">· ${i.meta}</span>`:''}
+        ${i.timing?`<span class="timing-badge t-${i.timing}">${{before:'до еды',after:'после еды',any:'независимо'}[i.timing]}</span>`:''}
+      </div>
+      <div class="allday-tag ${i.type==='pill'?'tag-pill':'tag-task'}">${i.type==='pill'?'💊':'✅'}</div>
+    </div>`).join('')}
+  </div>` : '';
 
-        protein = round((lean_mass or weight or 70) * protein_per_kg)
-        fat = round(calories * 0.25 / 9)
-        carbs = round((calories - protein * 4 - fat * 9) / 4)
+  // Timed
+  const groups = {};
+  timed.forEach(i=>{ const k=i.time||'??:??'; if(!groups[k])groups[k]=[]; groups[k].push(i); });
+  const icons = {meal:'🍽',pill:'💊',workout:'💪',task:'✅'};
+  document.getElementById('timelineSection').innerHTML = Object.entries(groups).map(([t,items])=>`
+    <div class="time-group">
+      <div class="time-label">${t}</div>
+      ${items.map(i=>`<div class="item type-${i.type} ${i.done?'done':''}" onclick="toggle(${i.id})">
+        <div class="item-icon">${icons[i.type]||'📌'}</div>
+        <div class="item-body">
+          <div class="item-name">${i.name}${i.timing?`<span class="timing-badge t-${i.timing}">${{before:'до еды',after:'после еды',any:'независимо'}[i.timing]}</span>`:''}</div>
+          ${i.meta?`<div class="item-meta">${i.meta}</div>`:''}
+        </div>
+        <div class="item-check">${i.done?'✓':''}</div>
+      </div>`).join('')}
+    </div>`).join('');
+}
 
-        return {
-            "calories": calories,
-            "protein": protein,
-            "fat": fat,
-            "carbs": carbs,
-            "bmr": round(bmr),
-            "tdee": round(tdee),
-        }
+function toggle(id) {
+  const item = S.items.find(i=>i.id===id); if(!item) return;
+  item.done = !item.done;
+  if(tg?.HapticFeedback) tg.HapticFeedback.impactOccurred('light');
+  showToast(item.done?'✓ Выполнено':'Отменено');
+  render();
+  const uid = tg?.initDataUnsafe?.user?.id;
+  if(uid) fetch('/webapp/toggle',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user_id:uid,item_id:id,done:item.done})}).catch(()=>{});
+}
 
-    async def format_inbody_summary(self, inbody: dict, kbju: dict, goal: str) -> str:
-        """Generate readable InBody analysis"""
-        fat_pct = inbody.get('fat_percent', '?')
-        muscle = inbody.get('muscle_mass', '?')
-        fat_mass = inbody.get('fat_mass', '?')
-        weight = inbody.get('weight', '?')
-        bmr = kbju.get('bmr', '?')
-        tdee = kbju.get('tdee', '?')
-        goal_text = {"cut": "сушка", "bulk": "набор", "maintain": "поддержание"}.get(goal, goal)
+// Sheet
+document.getElementById('fabBtn').onclick = () => {
+  document.getElementById('overlay').classList.add('open');
+  document.getElementById('sheet').classList.add('open');
+  document.getElementById('typePicker').style.display='block';
+  document.getElementById('itemForm').style.display='none';
+  document.getElementById('sheetTitle').textContent='Добавить в план';
+  document.querySelectorAll('.type-btn').forEach(b=>b.classList.remove('sel'));
+  S.type=null;
+  if(tg?.HapticFeedback) tg.HapticFeedback.impactOccurred('medium');
+};
+document.getElementById('overlay').onclick = closeSheet;
+function closeSheet() {
+  document.getElementById('overlay').classList.remove('open');
+  document.getElementById('sheet').classList.remove('open');
+}
 
-        response = self.client.messages.create(
-            model=self.model,
-            max_tokens=350,
-            messages=[{"role": "user", "content": f"""Дай краткий анализ состава тела по данным InBody.
-Тон: тренер, по делу, мотивирующе.
+function pickType(t) {
+  S.type=t;
+  document.querySelectorAll('.type-btn').forEach(b=>b.classList.toggle('sel',b.dataset.t===t));
+  setTimeout(()=>{
+    document.getElementById('typePicker').style.display='none';
+    document.getElementById('itemForm').style.display='block';
+    const lbl={meal:'Блюдо или продукт',pill:'Название препарата',workout:'Тип тренировки',task:'Задача'};
+    const ph={meal:'Например: Гречка с курицей',pill:'Например: Омега-3',workout:'Например: Ноги и плечи',task:'Например: Выпить воду'};
+    document.getElementById('nameLabel').textContent=lbl[t];
+    document.getElementById('nameInput').placeholder=ph[t];
+    document.getElementById('nameInput').value='';
+    document.getElementById('pillExtra').style.display=t==='pill'?'block':'none';
+    document.getElementById('mealExtra').style.display=t==='meal'?'block':'none';
+    const titles={meal:'Добавить еду',pill:'Добавить таблетку',workout:'Добавить тренировку',task:'Добавить задачу'};
+    document.getElementById('sheetTitle').textContent=titles[t];
+    document.getElementById('timeIn').style.display='block';
+  },120);
+}
 
-Данные:
-- Вес: {weight} кг
-- Мышечная масса: {muscle} кг
-- Жировая масса: {fat_mass} кг ({fat_pct}%)
-- Базовый метаболизм (BMR): {bmr} ккал
-- Суточный расход (TDEE): {tdee} ккал
-- Цель: {goal_text}
+function pickTiming(el) {
+  document.querySelectorAll('[data-timing]').forEach(b=>b.classList.remove('on'));
+  el.classList.add('on'); S.timing=el.dataset.timing;
+}
 
-Рассчитанный план:
-- Калории: {kbju['calories']} ккал
-- Белок: {kbju['protein']}г | Жиры: {kbju['fat']}г | Углеводы: {kbju['carbs']}г
+function pickTimeMode(el, mode) {
+  document.querySelectorAll('#itemForm .toggle-row .toggle-btn').forEach(b=>b.classList.remove('on'));
+  el.classList.add('on'); S.timeMode=mode;
+  document.getElementById('timeIn').style.display=mode==='time'?'block':'none';
+}
 
-Напиши 3-4 предложения: оценка состава тела, почему именно такой КБЖУ, на что обратить внимание. Только текст."""}]
-        )
-        return response.content[0].text
+function addItem() {
+  const name=document.getElementById('nameInput').value.trim();
+  if(!name){showToast('Введи название');return;}
+  const item={id:Date.now(),type:S.type,name,allday:S.timeMode==='allday',time:S.timeMode==='time'?document.getElementById('timeIn').value:null,done:false,meta:'',timing:S.type==='pill'?S.timing:null};
+  if(S.type==='pill'){item.meta=document.getElementById('doseInput').value.trim();document.getElementById('doseInput').value='';}
+  if(S.type==='meal'){
+    const cal=document.getElementById('calIn').value, prot=document.getElementById('protIn').value;
+    item.calories=cal?parseInt(cal):0; item.protein=prot?parseInt(prot):0;
+    item.meta=[cal?`${cal} ккал`:'',prot?`Б:${prot}г`:''].filter(Boolean).join(' · ');
+    document.getElementById('calIn').value=''; document.getElementById('protIn').value='';
+  }
+  if(S.type==='task'){item.meta=document.getElementById('noteIn').value.trim();document.getElementById('noteIn').value='';}
+  S.items.push(item);
+  closeSheet(); showToast('✓ Добавлено'); render();
+  if(tg?.HapticFeedback) tg.HapticFeedback.notificationOccurred('success');
+  const uid=tg?.initDataUnsafe?.user?.id;
+  if(uid) fetch('/webapp/add_item',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user_id:uid,item})}).catch(()=>{});
+}
 
+function showToast(msg) {
+  const t=document.getElementById('toast'); t.textContent=msg;
+  t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),2000);
+}
 
-    async def suggest_meal_with_groups(
-        self,
-        meal_type: str,
-        today_totals: dict | None,
-        plan: dict | None,
-        always_products: list,
-        frequent_products: list,
-        meal_history: list,
-    ) -> str:
-        """Suggest meal using product groups — only always+frequent, never oneoff"""
-        remaining = ""
-        if plan and today_totals:
-            cal_left = plan['calories'] - today_totals.get('calories', 0)
-            prot_left = plan['protein'] - today_totals.get('protein', 0)
-            fat_left = plan['fat'] - today_totals.get('fat', 0)
-            carbs_left = plan['carbs'] - today_totals.get('carbs', 0)
-            remaining = f"Осталось: {cal_left} ккал | Б:{prot_left}г Ж:{fat_left}г У:{carbs_left}г"
+function setDate() {
+  const d=new Date();
+  const days=['Вс','Пн','Вт','Ср','Чт','Пт','Сб'];
+  const months=['янв','фев','мар','апр','май','июн','июл','авг','сен','окт','ноя','дек'];
+  document.getElementById('dateLabel').textContent=`${days[d.getDay()]}, ${d.getDate()} ${months[d.getMonth()]}`;
+}
 
-        always_str = ", ".join([p['product_name'] for p in always_products]) or "не указаны"
-        frequent_str = ", ".join([p['product_name'] for p in frequent_products]) or "не указаны"
-
-        # Also get frequent items from history for context
-        food_freq = {}
-        for meal in meal_history:
-            desc = meal.get('description', '').strip()
-            if desc:
-                food_freq[desc] = food_freq.get(desc, 0) + 1
-        history_top = ", ".join([k for k, v in sorted(food_freq.items(), key=lambda x: -x[1])[:8]])
-
-        response = self.client.messages.create(
-            model=self.model,
-            max_tokens=400,
-            messages=[{"role": "user", "content": f"""Пользователь на сушке спрашивает что поесть на {meal_type}.
-
-{remaining}
-
-Продукты которые ВСЕГДА есть дома (приоритет для предложений):
-{always_str}
-
-Продукты которые ЧАСТО есть дома (можно предлагать):
-{frequent_str}
-
-Из истории питания также замечены:
-{history_top}
-
-ВАЖНО: предлагай ТОЛЬКО из продуктов "всегда" и "часто". Не придумывай другие.
-Предложи 2-3 конкретных варианта с КБЖУ под остаток дня.
-Тон: дружелюбный тренер, коротко."""}]
-        )
-        return response.content[0].text
-
-    async def classify_product_group(self, product_name: str, meal_count: int) -> str:
-        """Suggest group for a new product based on context"""
-        response = self.client.messages.create(
-            model=self.model,
-            max_tokens=100,
-            messages=[{"role": "user", "content": f"""Продукт "{product_name}" употреблялся {meal_count} раз.
-Верни ТОЛЬКО одно слово — группу продукта:
-- always (всегда в холодильнике, базовый продукт)
-- frequent (часто но не всегда)
-- oneoff (разовый, случайный)
-
-Ответ:"""}]
-        )
-        result = response.content[0].text.strip().lower()
-        if result in ('always', 'frequent', 'oneoff'):
-            return result
-        return 'frequent'
-
-    async def add_sleep_to_context(self, sleep_history: list) -> str:
-        """Format sleep data for AI context"""
-        if not sleep_history:
-            return ""
-        avg_hours = round(sum(s['hours'] for s in sleep_history) / len(sleep_history), 1)
-        last = sleep_history[0]
-        return f"СОН: последний {last['hours']}ч ({last['date']}), среднее за период: {avg_hours}ч"
-
-    async def generate_sleep_correlation(
-        self,
-        sleep_history: list,
-        weight_history: list,
-        meal_history: list,
-    ) -> str:
-        """Analyze sleep vs weight/nutrition correlations"""
-        if len(sleep_history) < 5:
-            return "Недостаточно данных по сну для анализа — нужно минимум 5 записей."
-
-        sleep_by_date = {s['date']: s['hours'] for s in sleep_history}
-        weight_by_date = {w['date']: w['weight'] for w in weight_history}
-
-        # Find overlapping dates
-        pairs = []
-        for date, hours in sleep_by_date.items():
-            if date in weight_by_date:
-                pairs.append(f"Сон {hours}ч → вес {weight_by_date[date]}кг")
-
-        pairs_str = "
-".join(pairs[:10]) if pairs else "нет пересечений"
-
-        avg_sleep = round(sum(sleep_by_date.values()) / len(sleep_by_date), 1)
-        short_sleep_days = [d for d, h in sleep_by_date.items() if h < 6]
-
-        response = self.client.messages.create(
-            model=self.model,
-            max_tokens=300,
-            messages=[{"role": "user", "content": f"""Проанализируй влияние сна на вес и питание пользователя.
-
-Данные сон → вес:
-{pairs_str}
-
-Средний сон: {avg_sleep}ч
-Дней с коротким сном (<6ч): {len(short_sleep_days)}
-
-Напиши 2-3 предложения: есть ли корреляция, как сон влияет на прогресс, конкретный совет.
-Только текст, без JSON."""}]
-        )
-        return response.content[0].text
-
-    def _build_context(self, today_totals, plan, schedule, recent_logs) -> str:
-        lines = []
-
-        if plan:
-            lines.append(f"ПЛАН ПИТАНИЯ: {plan['calories']} ккал | Б:{plan['protein']}г Ж:{plan['fat']}г У:{plan['carbs']}г")
-
-        if today_totals and today_totals.get('calories', 0) > 0:
-            lines.append(f"СЪЕДЕНО СЕГОДНЯ: {today_totals['calories']} ккал | Б:{today_totals['protein']}г Ж:{today_totals['fat']}г У:{today_totals['carbs']}г")
-            if plan:
-                left = plan['calories'] - today_totals['calories']
-                lines.append(f"ОСТАЛОСЬ: {left} ккал")
-
-        if schedule:
-            days_ru = {
-                "monday": "Пн", "tuesday": "Вт", "wednesday": "Ср",
-                "thursday": "Чт", "friday": "Пт", "saturday": "Сб", "sunday": "Вс"
-            }
-            sched_str = ", ".join([f"{days_ru.get(d, d)}: {i['name']} {i.get('time', '')}" for d, i in schedule.items()])
-            lines.append(f"РАСПИСАНИЕ ТРЕНИРОВОК: {sched_str}")
-
-        if recent_logs:
-            if recent_logs.get('workouts'):
-                last_w = recent_logs['workouts'][0]
-                lines.append(f"ПОСЛЕДНЯЯ ТРЕНИРОВКА: {last_w['date']} — {last_w.get('workout_type', '')} {last_w.get('summary', '')}")
-            if recent_logs.get('weights'):
-                last_weight = recent_logs['weights'][0]
-                lines.append(f"ПОСЛЕДНИЙ ВЕС: {last_weight['weight']} кг ({last_weight['date']})")
-
-        return "\n".join(lines) if lines else "Данных пока нет."
+setDate(); load();
+</script>
+</body>
+</html>
