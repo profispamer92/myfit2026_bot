@@ -1,0 +1,492 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<title>День</title>
+<link href="https://fonts.googleapis.com/css2?family=Unbounded:wght@400;600;700&family=Onest:wght@300;400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #0d0d14;
+    --surface: #14141f;
+    --surface2: #1c1c2e;
+    --border: rgba(255,255,255,0.07);
+    --accent: #7c6aff;
+    --accent2: #ff6a9a;
+    --green: #3effa0;
+    --yellow: #ffd166;
+    --text: #f0eeff;
+    --muted: rgba(240,238,255,0.45);
+    --pill-done: rgba(62,255,160,0.12);
+    --pill-todo: rgba(124,106,255,0.12);
+    --radius: 16px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Onest', sans-serif;
+    font-size: 15px;
+    min-height: 100vh;
+    padding-bottom: 80px;
+  }
+
+  /* Header */
+  .header {
+    padding: 20px 18px 0;
+    position: sticky; top: 0; z-index: 10;
+    background: linear-gradient(to bottom, var(--bg) 80%, transparent);
+  }
+  .header-top {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 14px;
+  }
+  .date-label {
+    font-family: 'Unbounded', sans-serif;
+    font-size: 11px; font-weight: 600;
+    letter-spacing: .12em;
+    color: var(--muted);
+    text-transform: uppercase;
+  }
+  .header-title {
+    font-family: 'Unbounded', sans-serif;
+    font-size: 20px; font-weight: 700;
+    background: linear-gradient(135deg, var(--accent), var(--accent2));
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+  }
+  .refresh-btn {
+    width: 34px; height: 34px; border-radius: 50%;
+    background: var(--surface2); border: 1px solid var(--border);
+    display: flex; align-items: center; justify-content: center;
+    cursor: pointer; font-size: 16px;
+    transition: transform .3s;
+  }
+  .refresh-btn.spinning { animation: spin .6s linear; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* КБЖУ bar */
+  .kbju-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 14px 16px;
+    margin-bottom: 10px;
+  }
+  .kbju-row {
+    display: flex; justify-content: space-between;
+    align-items: baseline; margin-bottom: 10px;
+  }
+  .kbju-cal {
+    font-family: 'Unbounded', sans-serif;
+    font-size: 22px; font-weight: 700;
+  }
+  .kbju-cal span { font-size: 12px; font-weight: 400; color: var(--muted); margin-left: 4px; }
+  .kbju-plan { font-size: 12px; color: var(--muted); }
+  .macro-bars { display: flex; gap: 6px; margin-bottom: 8px; }
+  .macro-bar { flex: 1; }
+  .macro-label {
+    font-size: 10px; color: var(--muted); margin-bottom: 4px;
+    display: flex; justify-content: space-between;
+  }
+  .bar-track {
+    height: 5px; border-radius: 3px;
+    background: rgba(255,255,255,0.08);
+    overflow: hidden;
+  }
+  .bar-fill {
+    height: 100%; border-radius: 3px;
+    transition: width .6s cubic-bezier(.4,0,.2,1);
+  }
+  .bar-p { background: linear-gradient(90deg, #7c6aff, #b06aff); }
+  .bar-f { background: linear-gradient(90deg, #ffd166, #ff9966); }
+  .bar-c { background: linear-gradient(90deg, #3effa0, #3ec8ff); }
+  .cal-bar-track {
+    height: 7px; border-radius: 4px;
+    background: rgba(255,255,255,0.08); overflow: hidden;
+  }
+  .cal-bar-fill {
+    height: 100%; border-radius: 4px;
+    background: linear-gradient(90deg, var(--accent), var(--accent2));
+    transition: width .6s cubic-bezier(.4,0,.2,1);
+  }
+
+  /* Stats row */
+  .stats-row {
+    display: flex; gap: 8px; margin-bottom: 10px;
+  }
+  .stat-pill {
+    flex: 1; background: var(--surface); border: 1px solid var(--border);
+    border-radius: 12px; padding: 10px 10px 8px;
+    display: flex; flex-direction: column; align-items: center; gap: 2px;
+  }
+  .stat-icon { font-size: 18px; }
+  .stat-val { font-family: 'Unbounded', sans-serif; font-size: 13px; font-weight: 600; }
+  .stat-lbl { font-size: 9px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
+
+  /* Section */
+  .section { margin: 0 0 10px; }
+  .section-header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 0 2px; margin-bottom: 8px;
+  }
+  .section-title {
+    font-family: 'Unbounded', sans-serif;
+    font-size: 11px; font-weight: 600;
+    letter-spacing: .1em; color: var(--muted);
+    text-transform: uppercase;
+  }
+  .section-count {
+    font-size: 11px; color: var(--muted);
+  }
+
+  /* Items */
+  .item {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 12px 14px;
+    margin-bottom: 6px;
+    display: flex; align-items: center; gap: 12px;
+    transition: opacity .2s, transform .15s;
+    cursor: pointer;
+    user-select: none;
+  }
+  .item:active { transform: scale(.98); }
+  .item.done { opacity: .5; }
+  .item.done .item-title { text-decoration: line-through; }
+
+  .item-icon {
+    width: 36px; height: 36px; border-radius: 10px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 18px; flex-shrink: 0;
+  }
+  .icon-meal { background: rgba(62,255,160,0.1); }
+  .icon-supp { background: rgba(255,209,102,0.1); }
+  .icon-task { background: rgba(124,106,255,0.1); }
+  .icon-workout { background: rgba(255,106,154,0.1); }
+
+  .item-body { flex: 1; min-width: 0; }
+  .item-title { font-size: 14px; font-weight: 500; }
+  .item-sub { font-size: 11px; color: var(--muted); margin-top: 2px; }
+  .item-time {
+    font-family: 'Unbounded', sans-serif;
+    font-size: 11px; font-weight: 600;
+    color: var(--muted); flex-shrink: 0;
+  }
+
+  .check {
+    width: 24px; height: 24px; border-radius: 50%;
+    border: 2px solid var(--border);
+    display: flex; align-items: center; justify-content: center;
+    flex-shrink: 0; transition: all .2s;
+    font-size: 12px;
+  }
+  .item.done .check {
+    background: var(--green); border-color: var(--green); color: #0d0d14;
+  }
+
+  /* Workout card */
+  .workout-card {
+    background: linear-gradient(135deg, rgba(124,106,255,.15), rgba(255,106,154,.1));
+    border: 1px solid rgba(124,106,255,.25);
+    border-radius: var(--radius);
+    padding: 14px 16px;
+    display: flex; align-items: center; gap: 12px;
+    margin-bottom: 6px;
+  }
+  .workout-icon {
+    width: 42px; height: 42px; border-radius: 12px;
+    background: rgba(124,106,255,.2);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 22px;
+  }
+  .workout-body { flex: 1; }
+  .workout-title { font-size: 15px; font-weight: 600; }
+  .workout-sub { font-size: 12px; color: var(--muted); margin-top: 2px; }
+  .workout-time {
+    font-family: 'Unbounded', sans-serif;
+    font-size: 13px; font-weight: 700;
+    color: var(--accent);
+  }
+
+  /* Empty state */
+  .empty {
+    text-align: center; padding: 20px;
+    color: var(--muted); font-size: 13px;
+  }
+
+  /* Bottom padding for safe area */
+  .bottom-space { height: 20px; }
+
+  /* Loading */
+  .loading {
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    height: 60vh; gap: 12px;
+  }
+  .loader {
+    width: 36px; height: 36px; border-radius: 50%;
+    border: 3px solid var(--surface2);
+    border-top-color: var(--accent);
+    animation: spin .8s linear infinite;
+  }
+  .loading-text { color: var(--muted); font-size: 13px; }
+
+  /* Error */
+  .error-box {
+    background: rgba(255,80,80,.1); border: 1px solid rgba(255,80,80,.2);
+    border-radius: var(--radius); padding: 14px 16px;
+    margin: 10px 0; font-size: 13px; color: #ff8080;
+  }
+
+  /* All items container */
+  .content { padding: 0 18px; }
+
+  /* Animate in */
+  .fade-in {
+    animation: fadeIn .3s ease forwards;
+    opacity: 0;
+  }
+  @keyframes fadeIn {
+    to { opacity: 1; transform: translateY(0); }
+    from { opacity: 0; transform: translateY(8px); }
+  }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="header-top">
+    <div>
+      <div class="date-label" id="dateLabel">—</div>
+      <div class="header-title">План дня</div>
+    </div>
+    <div class="refresh-btn" id="refreshBtn" onclick="loadData()">↻</div>
+  </div>
+</div>
+
+<div class="content" id="content">
+  <div class="loading">
+    <div class="loader"></div>
+    <div class="loading-text">Загружаю твой день...</div>
+  </div>
+</div>
+
+<script>
+const tg = window.Telegram?.WebApp;
+if (tg) { tg.ready(); tg.expand(); }
+
+const userId = tg?.initDataUnsafe?.user?.id || null;
+const BASE = window.location.origin;
+
+// Date header
+const now = new Date();
+const days = ['Воскресенье','Понедельник','Вторник','Среда','Четверг','Пятница','Суббота'];
+const months = ['января','февраля','марта','апреля','мая','июня','июля','августа','сентября','октября','ноября','декабря'];
+document.getElementById('dateLabel').textContent =
+  `${days[now.getDay()]}, ${now.getDate()} ${months[now.getMonth()]}`;
+
+function bar(val, max) {
+  return Math.min(100, max > 0 ? Math.round(val / max * 100) : 0);
+}
+
+function timingLabel(timing) {
+  return {
+    before_meal: 'до еды',
+    after_meal: 'после еды',
+    with_meal: 'во время еды',
+    independent: 'независимо'
+  }[timing] || timing || '';
+}
+
+async function markDone(type, id) {
+  if (!userId) return;
+  try {
+    await fetch(`${BASE}/api/mark_done`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ user_id: userId, type, id })
+    });
+    loadData();
+  } catch(e) { console.error(e); }
+}
+
+async function loadData() {
+  if (!userId) {
+    document.getElementById('content').innerHTML =
+      '<div class="error-box">⚠️ Открой через Telegram бота</div>';
+    return;
+  }
+
+  const btn = document.getElementById('refreshBtn');
+  btn.classList.add('spinning');
+
+  try {
+    const r = await fetch(`${BASE}/api/day_plan?user_id=${userId}`);
+    if (!r.ok) throw new Error('Server error');
+    const d = await r.json();
+    render(d);
+  } catch(e) {
+    document.getElementById('content').innerHTML =
+      `<div class="error-box">Ошибка загрузки: ${e.message}</div>`;
+  } finally {
+    setTimeout(() => btn.classList.remove('spinning'), 600);
+  }
+}
+
+function render(d) {
+  const plan = d.plan || {};
+  const totals = d.totals || {};
+  const meals = d.meals || [];
+  const supps = d.supplements || [];
+  const takenIds = d.supplements_taken || [];
+  const tasks = d.tasks || [];
+  const doneIds = d.tasks_done || [];
+  const activity = d.activity || {};
+  const sleep = d.sleep || null;
+  const weight = d.weight || null;
+  const workout = d.workout || null;
+
+  const cal = totals.calories || 0;
+  const planCal = plan.calories || 0;
+  const prot = totals.protein || 0;
+  const fat = totals.fat || 0;
+  const carbs = totals.carbs || 0;
+
+  let html = '';
+
+  // КБЖУ card
+  html += `<div class="kbju-card fade-in">
+    <div class="kbju-row">
+      <div class="kbju-cal">${cal}<span>ккал</span></div>
+      <div class="kbju-plan">из ${planCal} ккал</div>
+    </div>
+    <div class="cal-bar-track" style="margin-bottom:12px">
+      <div class="cal-bar-fill" style="width:${bar(cal,planCal)}%"></div>
+    </div>
+    <div class="macro-bars">
+      <div class="macro-bar">
+        <div class="macro-label"><span>Белок</span><span>${prot}г</span></div>
+        <div class="bar-track"><div class="bar-fill bar-p" style="width:${bar(prot,plan.protein||1)}%"></div></div>
+      </div>
+      <div class="macro-bar">
+        <div class="macro-label"><span>Жиры</span><span>${fat}г</span></div>
+        <div class="bar-track"><div class="bar-fill bar-f" style="width:${bar(fat,plan.fat||1)}%"></div></div>
+      </div>
+      <div class="macro-bar">
+        <div class="macro-label"><span>Углев</span><span>${carbs}г</span></div>
+        <div class="bar-track"><div class="bar-fill bar-c" style="width:${bar(carbs,plan.carbs||1)}%"></div></div>
+      </div>
+    </div>
+  </div>`;
+
+  // Stats row
+  const steps = activity.steps || 0;
+  const sleepH = sleep ? `${sleep.hours}ч` : '—';
+  const weightStr = weight ? `${weight}кг` : '—';
+  const burned = activity.calories_burned || 0;
+  html += `<div class="stats-row fade-in">
+    <div class="stat-pill"><div class="stat-icon">👟</div><div class="stat-val">${steps > 0 ? (steps/1000).toFixed(1)+'k' : '—'}</div><div class="stat-lbl">шаги</div></div>
+    <div class="stat-pill"><div class="stat-icon">🔥</div><div class="stat-val">${burned||'—'}</div><div class="stat-lbl">сожжено</div></div>
+    <div class="stat-pill"><div class="stat-icon">💤</div><div class="stat-val">${sleepH}</div><div class="stat-lbl">сон</div></div>
+    <div class="stat-pill"><div class="stat-icon">⚖️</div><div class="stat-val">${weightStr}</div><div class="stat-lbl">вес</div></div>
+  </div>`;
+
+  // Workout
+  if (workout) {
+    html += `<div class="section fade-in">
+      <div class="section-header"><div class="section-title">💪 Тренировка</div></div>
+      <div class="workout-card">
+        <div class="workout-icon">🏋️</div>
+        <div class="workout-body">
+          <div class="workout-title">${workout.name}</div>
+          <div class="workout-sub">Запланировано</div>
+        </div>
+        <div class="workout-time">${workout.time}</div>
+      </div>
+    </div>`;
+  }
+
+  // Supplements
+  if (supps.length > 0) {
+    const doneCount = supps.filter(s => takenIds.includes(s.id)).length;
+    html += `<div class="section fade-in">
+      <div class="section-header">
+        <div class="section-title">💊 Таблетки и БАДы</div>
+        <div class="section-count">${doneCount}/${supps.length}</div>
+      </div>`;
+    supps.forEach(s => {
+      const done = takenIds.includes(s.id);
+      html += `<div class="item ${done?'done':''}" onclick="markDone('supplement',${s.id})">
+        <div class="item-icon icon-supp">💊</div>
+        <div class="item-body">
+          <div class="item-title">${s.name}</div>
+          <div class="item-sub">${s.dose}${s.timing ? ' · ' + timingLabel(s.timing) : ''}</div>
+        </div>
+        ${s.time_of_day ? `<div class="item-time">${s.time_of_day}</div>` : ''}
+        <div class="check">${done ? '✓' : ''}</div>
+      </div>`;
+    });
+    html += `</div>`;
+  }
+
+  // Meals
+  if (meals.length > 0) {
+    html += `<div class="section fade-in">
+      <div class="section-header">
+        <div class="section-title">🍽 Питание</div>
+        <div class="section-count">${meals.length} записей</div>
+      </div>`;
+    meals.forEach(m => {
+      html += `<div class="item">
+        <div class="item-icon icon-meal">🥗</div>
+        <div class="item-body">
+          <div class="item-title">${m.description}</div>
+          <div class="item-sub">${m.calories} ккал · Б:${m.protein}г Ж:${m.fat}г У:${m.carbs}г</div>
+        </div>
+        <div class="item-time">${m.time}</div>
+      </div>`;
+    });
+    html += `</div>`;
+  }
+
+  // Tasks
+  if (tasks.length > 0) {
+    const doneCount = tasks.filter(t => doneIds.includes(t.id)).length;
+    html += `<div class="section fade-in">
+      <div class="section-header">
+        <div class="section-title">✅ Задачи</div>
+        <div class="section-count">${doneCount}/${tasks.length}</div>
+      </div>`;
+    tasks.forEach(t => {
+      const done = doneIds.includes(t.id);
+      html += `<div class="item ${done?'done':''}" onclick="markDone('task',${t.id})">
+        <div class="item-icon icon-task">${done ? '✅' : '⬜'}</div>
+        <div class="item-body">
+          <div class="item-title">${t.title}</div>
+          ${t.repeat === 'daily' ? '<div class="item-sub">каждый день</div>' : ''}
+        </div>
+        ${t.time_str ? `<div class="item-time">${t.time_str}</div>` : ''}
+        <div class="check">${done ? '✓' : ''}</div>
+      </div>`;
+    });
+    html += `</div>`;
+  }
+
+  if (!workout && supps.length === 0 && meals.length === 0 && tasks.length === 0) {
+    html += `<div class="empty fade-in">
+      <div style="font-size:40px;margin-bottom:8px">🌅</div>
+      День пока пустой — напиши боту что съел или что запланировал
+    </div>`;
+  }
+
+  html += '<div class="bottom-space"></div>';
+  document.getElementById('content').innerHTML = html;
+}
+
+loadData();
+// Auto-refresh every 30s
+setInterval(loadData, 30000);
+</script>
+</body>
+</html>
