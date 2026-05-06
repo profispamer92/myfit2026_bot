@@ -359,8 +359,29 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         await update.message.reply_text(f"🎤 _{text}_", parse_mode="Markdown")
-        update.message.text = text
-        await handle_text(update, context)
+
+        # Process transcribed text directly via AI
+        if 'chat_history' not in context.user_data:
+            context.user_data['chat_history'] = []
+        context.user_data['chat_history'].append({"role": "user", "content": text})
+        if len(context.user_data['chat_history']) > 40:
+            context.user_data['chat_history'] = context.user_data['chat_history'][-40:]
+
+        full_context = _build_full_context(user_id)
+        chat_history = context.user_data['chat_history']
+
+        await update.message.chat.send_action("typing")
+        try:
+            result = await ai.process_message(text, full_context, chat_history[:-1])
+        except Exception as e:
+            logger.error(f"AI error: {e}")
+            await update.message.reply_text(
+                "Что-то пошло не так. Попробуй ещё раз.",
+                reply_markup=main_keyboard()
+            )
+            return
+
+        await _execute_intent(update, context, result)
     except Exception as e:
         logger.error(f"Voice error: {e}")
         await update.message.reply_text(
