@@ -1,1 +1,1 @@
-3.11
+self.model = "claude-sonnet-4-5"
