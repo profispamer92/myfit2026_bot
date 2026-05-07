@@ -1200,4 +1200,4 @@ class Database:
                     for r in rows
                 ]
             except Exception:
-                return [
+                return []
