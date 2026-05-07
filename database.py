@@ -2,18 +2,24 @@ import sqlite3
 import json
 from datetime import datetime, date, timedelta
 from typing import Optional
-
-
+ 
+ 
 class Database:
-    def __init__(self, db_path: str = "fitness.db"):
+    def __init__(self, db_path: str = None):
+        import os
+        if db_path is None:
+            if os.path.exists('/data') and os.path.isdir('/data'):
+                db_path = '/data/fitness.db'
+            else:
+                db_path = 'fitness.db'
         self.db_path = db_path
         self._init_db()
-
+ 
     def _conn(self):
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         return conn
-
+ 
     def _init_db(self):
         with self._conn() as conn:
             conn.executescript("""
@@ -21,7 +27,7 @@ class Database:
                     user_id INTEGER PRIMARY KEY,
                     created_at TEXT DEFAULT (datetime('now'))
                 );
-
+ 
                 CREATE TABLE IF NOT EXISTS user_profiles (
                     user_id INTEGER PRIMARY KEY,
                     weight REAL,
@@ -31,7 +37,7 @@ class Database:
                     goal TEXT,
                     updated_at TEXT DEFAULT (datetime('now'))
                 );
-
+ 
                 CREATE TABLE IF NOT EXISTS nutrition_plans (
                     user_id INTEGER PRIMARY KEY,
                     calories INTEGER,
@@ -40,7 +46,7 @@ class Database:
                     carbs INTEGER,
                     updated_at TEXT DEFAULT (datetime('now'))
                 );
-
+ 
                 CREATE TABLE IF NOT EXISTS daily_plan_overrides (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id INTEGER,
@@ -53,27 +59,27 @@ class Database:
                     created_at TEXT DEFAULT (datetime('now')),
                     UNIQUE(user_id, date)
                 );
-
+ 
                 CREATE TABLE IF NOT EXISTS pending_plan_changes (
                     user_id INTEGER PRIMARY KEY,
                     new_plan_json TEXT,
                     reason TEXT,
                     created_at TEXT DEFAULT (datetime('now'))
                 );
-
+ 
                 CREATE TABLE IF NOT EXISTS notifications (
                     user_id INTEGER,
                     notification_type TEXT,
                     last_sent TEXT,
                     PRIMARY KEY (user_id, notification_type)
                 );
-
+ 
                 CREATE TABLE IF NOT EXISTS workout_schedules (
                     user_id INTEGER PRIMARY KEY,
                     schedule_json TEXT,
                     updated_at TEXT DEFAULT (datetime('now'))
                 );
-
+ 
                 CREATE TABLE IF NOT EXISTS meal_logs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id INTEGER,
@@ -86,7 +92,7 @@ class Database:
                     carbs REAL,
                     created_at TEXT DEFAULT (datetime('now'))
                 );
-
+ 
                 CREATE TABLE IF NOT EXISTS workout_logs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id INTEGER,
@@ -97,7 +103,7 @@ class Database:
                     exercises_json TEXT,
                     created_at TEXT DEFAULT (datetime('now'))
                 );
-
+ 
                 CREATE TABLE IF NOT EXISTS weight_logs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id INTEGER,
@@ -106,13 +112,13 @@ class Database:
                     created_at TEXT DEFAULT (datetime('now'))
                 );
             """)
-
+ 
     def ensure_user(self, user_id: int):
         with self._conn() as conn:
             conn.execute(
                 "INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,)
             )
-
+ 
     def save_nutrition_plan(self, user_id: int, plan: dict, is_base: bool = True):
         with self._conn() as conn:
             conn.execute("""
@@ -122,7 +128,7 @@ class Database:
         if not is_base:
             # Also save as today-only override
             self.save_daily_override(user_id, plan, reason="manual")
-
+ 
     def save_daily_override(self, user_id: int, plan: dict, reason: str = ""):
         from datetime import date
         today = date.today().isoformat()
@@ -132,7 +138,7 @@ class Database:
                 (user_id, date, calories, protein, fat, carbs, reason)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
             """, (user_id, today, plan['calories'], plan['protein'], plan['fat'], plan['carbs'], reason))
-
+ 
     def get_todays_plan(self, user_id: int) -> dict | None:
         """Returns today override if exists, else base plan"""
         from datetime import date
@@ -145,7 +151,7 @@ class Database:
             if override:
                 return dict(override)
         return self.get_nutrition_plan(user_id)
-
+ 
     def save_user_profile(self, user_id: int, profile: dict):
         with self._conn() as conn:
             # Add goal_type and goal_value columns if missing
@@ -164,19 +170,19 @@ class Database:
             """, (user_id, profile.get('weight'), profile.get('height'),
                   profile.get('age'), profile.get('activity'), profile.get('goal'),
                   profile.get('goal_type'), profile.get('goal_value')))
-
+ 
     def get_user_profile(self, user_id: int) -> dict | None:
         with self._conn() as conn:
             row = conn.execute(
                 "SELECT * FROM user_profiles WHERE user_id=?", (user_id,)
             ).fetchone()
             return dict(row) if row else None
-
+ 
     def get_all_users(self) -> list:
         with self._conn() as conn:
             rows = conn.execute("SELECT user_id FROM users").fetchall()
             return [dict(r) for r in rows]
-
+ 
     def get_weight_history(self, user_id: int, days: int = 30) -> list:
         from datetime import date, timedelta
         cutoff = (date.today() - timedelta(days=days)).isoformat()
@@ -187,7 +193,7 @@ class Database:
                 ORDER BY date DESC
             """, (user_id, cutoff)).fetchall()
             return [dict(r) for r in rows]
-
+ 
     def save_pending_plan(self, user_id: int, new_plan: dict | None, reason: str):
         import json
         with self._conn() as conn:
@@ -195,7 +201,7 @@ class Database:
                 INSERT OR REPLACE INTO pending_plan_changes (user_id, new_plan_json, reason, created_at)
                 VALUES (?, ?, ?, datetime('now'))
             """, (user_id, json.dumps(new_plan) if new_plan else None, reason))
-
+ 
     def get_pending_plan(self, user_id: int) -> dict | None:
         import json
         with self._conn() as conn:
@@ -208,11 +214,11 @@ class Database:
             if result.get('new_plan_json'):
                 result['new_plan'] = json.loads(result['new_plan_json'])
             return result
-
+ 
     def clear_pending_plan(self, user_id: int):
         with self._conn() as conn:
             conn.execute("DELETE FROM pending_plan_changes WHERE user_id=?", (user_id,))
-
+ 
     def get_last_notifications(self, user_id: int) -> dict:
         with self._conn() as conn:
             rows = conn.execute(
@@ -220,35 +226,35 @@ class Database:
                 (user_id,)
             ).fetchall()
             return {r['notification_type']: r['last_sent'] for r in rows}
-
+ 
     def save_notification(self, user_id: int, notification_type: str, date_str: str):
         with self._conn() as conn:
             conn.execute("""
                 INSERT OR REPLACE INTO notifications (user_id, notification_type, last_sent)
                 VALUES (?, ?, ?)
             """, (user_id, notification_type, date_str))
-
+ 
     def get_nutrition_plan(self, user_id: int) -> Optional[dict]:
         with self._conn() as conn:
             row = conn.execute(
                 "SELECT * FROM nutrition_plans WHERE user_id = ?", (user_id,)
             ).fetchone()
             return dict(row) if row else None
-
+ 
     def save_workout_schedule(self, user_id: int, schedule: dict):
         with self._conn() as conn:
             conn.execute("""
                 INSERT OR REPLACE INTO workout_schedules (user_id, schedule_json, updated_at)
                 VALUES (?, ?, datetime('now'))
             """, (user_id, json.dumps(schedule, ensure_ascii=False)))
-
+ 
     def get_workout_schedule(self, user_id: int) -> Optional[dict]:
         with self._conn() as conn:
             row = conn.execute(
                 "SELECT schedule_json FROM workout_schedules WHERE user_id = ?", (user_id,)
             ).fetchone()
             return json.loads(row['schedule_json']) if row else None
-
+ 
     def log_meal(self, user_id: int, meal: dict):
         today = date.today().isoformat()
         now = datetime.now().strftime("%H:%M")
@@ -264,7 +270,7 @@ class Database:
                 meal.get('fat', 0),
                 meal.get('carbs', 0)
             ))
-
+ 
     def log_workout(self, user_id: int, workout: dict):
         today = date.today().isoformat()
         now = datetime.now().strftime("%H:%M")
@@ -278,7 +284,7 @@ class Database:
                 workout.get('summary', ''),
                 json.dumps(workout.get('exercises', []), ensure_ascii=False)
             ))
-
+ 
     def log_weight(self, user_id: int, weight: float):
         today = date.today().isoformat()
         with self._conn() as conn:
@@ -286,7 +292,7 @@ class Database:
                 INSERT INTO weight_logs (user_id, date, weight)
                 VALUES (?, ?, ?)
             """, (user_id, today, weight))
-
+ 
     def get_today_totals(self, user_id: int) -> Optional[dict]:
         today = date.today().isoformat()
         with self._conn() as conn:
@@ -299,7 +305,7 @@ class Database:
                 FROM meal_logs WHERE user_id = ? AND date = ?
             """, (user_id, today)).fetchone()
             return dict(row) if row else None
-
+ 
     def get_today_meals(self, user_id: int) -> list:
         today = date.today().isoformat()
         with self._conn() as conn:
@@ -309,7 +315,7 @@ class Database:
                 ORDER BY time
             """, (user_id, today)).fetchall()
             return [dict(r) for r in rows]
-
+ 
     def get_week_stats(self, user_id: int) -> list:
         today = date.today()
         week_ago = (today - timedelta(days=6)).isoformat()
@@ -327,7 +333,7 @@ class Database:
                 ORDER BY date DESC
             """, (user_id, week_ago)).fetchall()
             return [dict(r) for r in rows]
-
+ 
     def get_recent_logs(self, user_id: int, days: int = 3) -> dict:
         cutoff = (date.today() - timedelta(days=days)).isoformat()
         with self._conn() as conn:
@@ -336,25 +342,25 @@ class Database:
                 FROM meal_logs WHERE user_id = ? AND date >= ?
                 ORDER BY date DESC, time DESC LIMIT 20
             """, (user_id, cutoff)).fetchall()
-
+ 
             workouts = conn.execute("""
                 SELECT date, time, workout_type, summary
                 FROM workout_logs WHERE user_id = ? AND date >= ?
                 ORDER BY date DESC LIMIT 10
             """, (user_id, cutoff)).fetchall()
-
+ 
             weights = conn.execute("""
                 SELECT date, weight FROM weight_logs
                 WHERE user_id = ? AND date >= ?
                 ORDER BY date DESC LIMIT 5
             """, (user_id, cutoff)).fetchall()
-
+ 
         return {
             "meals": [dict(r) for r in meals],
             "workouts": [dict(r) for r in workouts],
             "weights": [dict(r) for r in weights]
         }
-
+ 
     def log_activity(self, user_id: int, data: dict):
         """Log steps, calories burned, workouts from Health/Shortcuts"""
         from datetime import date
@@ -385,7 +391,7 @@ class Database:
                 data.get('active_minutes', 0),
                 data.get('source', 'manual')
             ))
-
+ 
     def get_today_activity(self, user_id: int) -> dict | None:
         from datetime import date
         today = date.today().isoformat()
@@ -408,7 +414,7 @@ class Database:
                 (user_id, today)
             ).fetchone()
             return dict(row) if row else None
-
+ 
     def get_meal_history(self, user_id: int, days: int = 30) -> list:
         """Get all meals from last N days for pattern analysis"""
         from datetime import date, timedelta
@@ -421,7 +427,7 @@ class Database:
                 ORDER BY date DESC
             """, (user_id, cutoff)).fetchall()
             return [dict(r) for r in rows]
-
+ 
     def log_activity_for_date(self, user_id: int, data: dict, for_date: str):
         """Log activity for a specific date (used for yesterday's steps sync)"""
         with self._conn() as conn:
@@ -452,7 +458,7 @@ class Database:
                 data.get('active_minutes', 0),
                 data.get('source', 'shortcuts')
             ))
-
+ 
     def log_weight_for_date(self, user_id: int, weight: float, for_date: str, measured_at: str = None):
         """Log weight for a specific date with optional measurement time"""
         with self._conn() as conn:
@@ -476,7 +482,7 @@ class Database:
                 "INSERT INTO weight_logs (user_id, date, weight) VALUES (?, ?, ?)",
                 (user_id, for_date, weight)
             )
-
+ 
     def get_month_stats(self, user_id: int) -> list:
         from datetime import date, timedelta
         cutoff = (date.today() - timedelta(days=30)).isoformat()
@@ -491,7 +497,7 @@ class Database:
                 GROUP BY date ORDER BY date DESC
             """, (user_id, cutoff)).fetchall()
             return [dict(r) for r in rows]
-
+ 
     def get_activity_history(self, user_id: int, days: int = 30) -> list:
         from datetime import date, timedelta
         cutoff = (date.today() - timedelta(days=days)).isoformat()
@@ -505,7 +511,7 @@ class Database:
                 return [dict(r) for r in rows]
             except Exception:
                 return []
-
+ 
     def get_latest_weight(self, user_id: int) -> float | None:
         with self._conn() as conn:
             row = conn.execute("""
@@ -513,7 +519,7 @@ class Database:
                 ORDER BY date DESC LIMIT 1
             """, (user_id,)).fetchone()
             return row['weight'] if row else None
-
+ 
     def save_inbody(self, user_id: int, data: dict):
         """Save InBody measurement"""
         from datetime import date
@@ -546,7 +552,7 @@ class Database:
                 data.get('bmr'), data.get('body_water'),
                 data.get('visceral_fat'), json.dumps(data)
             ))
-
+ 
     def get_latest_inbody(self, user_id: int) -> dict | None:
         import json
         with self._conn() as conn:
@@ -558,7 +564,7 @@ class Database:
                 return dict(row) if row else None
             except Exception:
                 return None
-
+ 
     def get_inbody_history(self, user_id: int) -> list:
         import json
         with self._conn() as conn:
@@ -571,7 +577,7 @@ class Database:
                 return [dict(r) for r in rows]
             except Exception:
                 return []
-
+ 
     def log_sleep(self, user_id: int, hours: float, quality: str = None, date_str: str = None):
         from datetime import date
         target_date = date_str or date.today().isoformat()
@@ -592,7 +598,7 @@ class Database:
                 INSERT OR REPLACE INTO sleep_logs (user_id, date, hours, quality, source)
                 VALUES (?, ?, ?, ?, ?)
             """, (user_id, target_date, hours, quality, 'shortcuts' if date_str else 'manual'))
-
+ 
     def get_sleep_history(self, user_id: int, days: int = 30) -> list:
         from datetime import date, timedelta
         cutoff = (date.today() - timedelta(days=days)).isoformat()
@@ -605,7 +611,7 @@ class Database:
                 return [dict(r) for r in rows]
             except Exception:
                 return []
-
+ 
     def get_last_sleep(self, user_id: int) -> dict | None:
         with self._conn() as conn:
             try:
@@ -616,7 +622,7 @@ class Database:
                 return dict(row) if row else None
             except Exception:
                 return None
-
+ 
     # --- Product groups ---
     def save_product_group(self, user_id: int, product_name: str, group: str):
         """group: 'always' | 'frequent' | 'oneoff'"""
@@ -635,7 +641,7 @@ class Database:
                 INSERT OR REPLACE INTO product_groups (user_id, product_name, group_name)
                 VALUES (?, ?, ?)
             """, (user_id, product_name.lower().strip(), group))
-
+ 
     def get_products_by_group(self, user_id: int, group: str = None) -> list:
         with self._conn() as conn:
             try:
@@ -662,7 +668,7 @@ class Database:
                 return [dict(r) for r in rows]
             except Exception:
                 return []
-
+ 
     def get_product_group(self, user_id: int, product_name: str) -> str | None:
         with self._conn() as conn:
             try:
@@ -673,7 +679,7 @@ class Database:
                 return row['group_name'] if row else None
             except Exception:
                 return None
-
+ 
     def auto_classify_product(self, user_id: int, product_name: str) -> str | None:
         """Auto-classify based on meal frequency in logs"""
         with self._conn() as conn:
@@ -690,7 +696,7 @@ class Database:
                 return None
             except Exception:
                 return None
-
+ 
     def remove_product_group(self, user_id: int, product_name: str):
         with self._conn() as conn:
             try:
@@ -700,7 +706,7 @@ class Database:
                 )
             except Exception:
                 pass
-
+ 
     # --- Supplements / Medications ---
     def save_supplement(self, user_id: int, name: str, dose: str, timing: str, time_of_day: str = None):
         """timing: before_meal|after_meal|with_meal|independent. time_of_day: 08:00 etc"""
@@ -721,7 +727,7 @@ class Database:
                 INSERT INTO supplements (user_id, name, dose, timing, time_of_day)
                 VALUES (?, ?, ?, ?, ?)
             """, (user_id, name, dose, timing, time_of_day))
-
+ 
     def get_supplements(self, user_id: int) -> list:
         with self._conn() as conn:
             try:
@@ -732,7 +738,7 @@ class Database:
                 return [dict(r) for r in rows]
             except Exception:
                 return []
-
+ 
     def log_supplement_taken(self, user_id: int, supplement_id: int):
         from datetime import date
         with self._conn() as conn:
@@ -750,7 +756,7 @@ class Database:
                 INSERT OR REPLACE INTO supplement_logs (user_id, supplement_id, date)
                 VALUES (?, ?, ?)
             """, (user_id, supplement_id, date.today().isoformat()))
-
+ 
     def get_supplements_taken_today(self, user_id: int) -> list:
         from datetime import date
         today = date.today().isoformat()
@@ -763,7 +769,7 @@ class Database:
                 return [r['supplement_id'] for r in rows]
             except Exception:
                 return []
-
+ 
     # --- Tasks ---
     def save_task(self, user_id: int, title: str, time_str: str = None, repeat: str = None):
         """repeat: daily|weekly|none"""
@@ -784,7 +790,7 @@ class Database:
                 INSERT INTO tasks (user_id, title, time_str, date, repeat)
                 VALUES (?, ?, ?, ?, ?)
             """, (user_id, title, time_str, date.today().isoformat(), repeat or 'none'))
-
+ 
     def get_tasks_today(self, user_id: int) -> list:
         from datetime import date
         today = date.today().isoformat()
@@ -798,7 +804,7 @@ class Database:
                 return [dict(r) for r in rows]
             except Exception:
                 return []
-
+ 
     def log_task_done(self, user_id: int, task_id: int):
         from datetime import date
         with self._conn() as conn:
@@ -816,7 +822,7 @@ class Database:
                 INSERT OR REPLACE INTO task_logs (user_id, task_id, date)
                 VALUES (?, ?, ?)
             """, (user_id, task_id, date.today().isoformat()))
-
+ 
     def get_tasks_done_today(self, user_id: int) -> list:
         from datetime import date
         today = date.today().isoformat()
@@ -828,7 +834,7 @@ class Database:
                 return [r['task_id'] for r in rows]
             except Exception:
                 return []
-
+ 
     def get_full_day_plan(self, user_id: int) -> dict:
         """Return complete day plan: meals, supplements, tasks, workout"""
         from datetime import date
@@ -844,11 +850,11 @@ class Database:
         sleep = self.get_last_sleep(user_id)
         weight = self.get_latest_weight(user_id)
         schedule = self.get_workout_schedule(user_id)
-
+ 
         from datetime import datetime
         day_name = datetime.now().strftime('%A').lower()
         today_workout = schedule.get(day_name) if schedule else None
-
+ 
         return {
             'date': today,
             'plan': plan,
@@ -863,7 +869,7 @@ class Database:
             'weight': weight,
             'workout': today_workout,
         }
-
+ 
     # --- Weekly template ---
     def save_weekly_template(self, user_id: int, template: dict):
         """Save full weekly meal/task template. template = {monday: {...}, tuesday: {...}, ...}"""
@@ -880,7 +886,7 @@ class Database:
                 INSERT OR REPLACE INTO weekly_templates (user_id, template_json, updated_at)
                 VALUES (?, ?, datetime('now'))
             """, (user_id, json.dumps(template, ensure_ascii=False)))
-
+ 
     def get_weekly_template(self, user_id: int) -> dict | None:
         import json
         with self._conn() as conn:
@@ -899,7 +905,7 @@ class Database:
                 return json.loads(row['template_json']) if row else None
             except Exception:
                 return None
-
+ 
     def save_day_override(self, user_id: int, date_str: str, override: dict):
         """Save today-only override of the weekly template"""
         import json
@@ -918,7 +924,7 @@ class Database:
                 INSERT OR REPLACE INTO day_overrides (user_id, date, override_json)
                 VALUES (?, ?, ?)
             """, (user_id, date_str, json.dumps(override, ensure_ascii=False)))
-
+ 
     def get_day_override(self, user_id: int, date_str: str) -> dict | None:
         import json
         with self._conn() as conn:
@@ -930,7 +936,7 @@ class Database:
                 return json.loads(row['override_json']) if row else None
             except Exception:
                 return None
-
+ 
     def get_effective_day_plan(self, user_id: int) -> dict | None:
         """Returns today override if exists, else weekly template for today"""
         from datetime import date, datetime
@@ -944,7 +950,7 @@ class Database:
         days = ["monday","tuesday","wednesday","thursday","friday","saturday","sunday"]
         today_name = days[datetime.now().weekday()]
         return template.get(today_name)
-
+ 
     def get_effective_day_plan_for_date(self, user_id: int, date_str: str) -> dict | None:
         """Returns plan for specific date"""
         from datetime import datetime
@@ -957,7 +963,7 @@ class Database:
         d = datetime.fromisoformat(date_str)
         days = ["monday","tuesday","wednesday","thursday","friday","saturday","sunday"]
         return template.get(days[d.weekday()])
-
+ 
     def save_morning_checkin_done(self, user_id: int, date_str: str):
         with self._conn() as conn:
             conn.execute("""
@@ -971,7 +977,7 @@ class Database:
                 "INSERT OR REPLACE INTO morning_checkins (user_id, date) VALUES (?, ?)",
                 (user_id, date_str)
             )
-
+ 
     def get_morning_checkin_done(self, user_id: int, date_str: str) -> bool:
         with self._conn() as conn:
             try:
@@ -982,7 +988,7 @@ class Database:
                 return bool(row)
             except Exception:
                 return False
-
+ 
     # --- Products database (auto-accumulating) ---
     def add_or_update_product(self, user_id: int, product_data: dict):
         """Add product or update. Tracks usage by week, auto-promotes/demotes."""
@@ -1021,12 +1027,12 @@ class Database:
             name_norm = name.lower().strip()
             import re
             name_norm = re.sub(r'\s*\d+\s*г\s*$', '', name_norm).strip()
-
+ 
             existing = conn.execute(
                 "SELECT id FROM products WHERE user_id=? AND name_normalized=?",
                 (user_id, name_norm)
             ).fetchone()
-
+ 
             today = date.today().isoformat()
             if existing:
                 pid = existing['id']
@@ -1055,7 +1061,7 @@ class Database:
                     "INSERT OR IGNORE INTO product_usage (user_id, product_id, used_date) VALUES (?, ?, ?)",
                     (user_id, pid, today)
                 )
-
+ 
     def get_product_weekly_stats(self, user_id: int) -> list:
         """For each product: days used in last week, last 30 days. Returns list with promotion candidates."""
         from datetime import date, timedelta
@@ -1076,7 +1082,7 @@ class Database:
                 return [dict(r) for r in rows]
             except Exception:
                 return []
-
+ 
     def find_promotion_candidates(self, user_id: int) -> list:
         """Products that should be promoted from oneoff -> frequent or frequent -> always.
         Returns list ready for AI to ask confirmation."""
@@ -1093,7 +1099,7 @@ class Database:
             elif current_group == 'frequent' and week_uses >= 5 and month_uses >= 15:
                 candidates.append({'id': p['id'], 'name': p['name'], 'suggested_group': 'always', 'week_uses': week_uses, 'month_uses': month_uses})
         return candidates
-
+ 
     def find_demotion_candidates(self, user_id: int) -> list:
         """Products that haven't been used for a month — demote always->frequent or frequent->oneoff"""
         stats = self.get_product_weekly_stats(user_id)
@@ -1105,7 +1111,7 @@ class Database:
                 new_group = 'frequent' if current_group == 'always' else 'oneoff'
                 candidates.append({'id': p['id'], 'name': p['name'], 'current_group': current_group, 'suggested_group': new_group})
         return candidates
-
+ 
     def mark_product_group(self, user_id: int, name: str, group: str):
         with self._conn() as conn:
             try:
@@ -1116,7 +1122,7 @@ class Database:
                 )
             except Exception:
                 pass
-
+ 
     def get_products_summary(self, user_id: int) -> dict:
         """Get top products grouped by category for AI context"""
         with self._conn() as conn:
@@ -1138,7 +1144,7 @@ class Database:
                 """, (user_id,)).fetchall()
             except Exception:
                 return {}
-
+ 
         result = {'always': [], 'frequent': [], 'oneoff': []}
         for r in rows:
             d = dict(r)
@@ -1151,10 +1157,47 @@ class Database:
                     'portion_g': d.get('standard_portion_g'),
                 })
         return result
-
+ 
     def clear_today_meals(self, user_id: int):
         from datetime import date
         today = date.today().isoformat()
         with self._conn() as conn:
             conn.execute("DELETE FROM meal_logs WHERE user_id=? AND date=?", (user_id, today))
-
+ 
+    def cleanup_old_overrides(self, user_id: int):
+        """Remove day_overrides where date is in the past (before this Monday).
+        Override стирается когда наступает понедельник после своей даты."""
+        from datetime import date, timedelta
+        today = date.today()
+        # This Monday (or today if today is Monday)
+        days_since_monday = today.weekday()
+        this_monday = today - timedelta(days=days_since_monday)
+        cutoff = this_monday.isoformat()
+        with self._conn() as conn:
+            try:
+                conn.execute(
+                    "DELETE FROM day_overrides WHERE user_id=? AND date < ?",
+                    (user_id, cutoff)
+                )
+            except Exception:
+                pass
+ 
+    def get_future_overrides(self, user_id: int, days_ahead: int = 7) -> list:
+        """Get all day overrides for next N days"""
+        from datetime import date, timedelta
+        today = date.today().isoformat()
+        end = (date.today() + timedelta(days=days_ahead)).isoformat()
+        with self._conn() as conn:
+            try:
+                rows = conn.execute("""
+                    SELECT date, override_json FROM day_overrides
+                    WHERE user_id=? AND date >= ? AND date <= ?
+                    ORDER BY date
+                """, (user_id, today, end)).fetchall()
+                import json
+                return [
+                    {"date": r["date"], "plan": json.loads(r["override_json"])}
+                    for r in rows
+                ]
+            except Exception:
+                return [
