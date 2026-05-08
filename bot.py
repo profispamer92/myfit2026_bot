@@ -841,6 +841,7 @@ async def _send_long_message(update: Update, text: str, reply_markup=None, max_l
 
 def _build_full_context(user_id: int) -> dict:
     """Build complete context for Claude — everything it needs to know"""
+    from datetime import date, timedelta
     profile = db.get_user_profile(user_id) or {}
     plan = db.get_nutrition_plan(user_id) or {}
     schedule = db.get_workout_schedule(user_id) or {}
@@ -873,7 +874,6 @@ def _build_full_context(user_id: int) -> dict:
     future_overrides = db.get_future_overrides(user_id, days_ahead=7) or []
 
     # Add yesterday's data for context
-    from datetime import date, timedelta
     yesterday = (date.today() - timedelta(days=1)).isoformat()
     day_before = (date.today() - timedelta(days=2)).isoformat()
     yesterday_meals = []
