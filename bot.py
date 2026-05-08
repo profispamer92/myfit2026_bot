@@ -370,50 +370,99 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file_bytes = bytes(await file.download_as_bytearray())
 
         if name.endswith('.zip') or 'zip' in mime:
-            await update.message.reply_text("📦 Парсю Apple Health (это может занять минуту-две)...")
+            await update.message.reply_text("📦 Парсю Apple Health (1-2 минуты)...")
             try:
-                result = import_apple_health_zip(user_id, file_bytes, db)
+                parsed = parse_apple_health_zip(file_bytes)
             except Exception as e:
                 logger.error(f"Apple Health import error: {e}")
-                await update.message.reply_text(f"Ошибка импорта: {e}", reply_markup=main_keyboard())
+                await update.message.reply_text(f"Ошибка: {e}", reply_markup=main_keyboard())
                 return
 
-            if result.get('error'):
-                await update.message.reply_text(f"❌ {result['error']}", reply_markup=main_keyboard())
+            if parsed.get('error'):
+                await update.message.reply_text(f"❌ {parsed['error']}", reply_markup=main_keyboard())
                 return
 
-            saved = result.get('saved', {})
-            dr = result.get('date_range', {}) or {}
-            msg = (
-                f"✅ *Apple Health импортирован!*\n\n"
-                f"📅 Период: {dr.get('from', '?')} — {dr.get('to', '?')}\n"
-                f"⚖️ Замеров веса: {saved.get('weight', 0)}\n"
-                f"👟 Дней с шагами: {saved.get('activity', 0)}\n"
-                f"💤 Дней со сном: {saved.get('sleep', 0)}\n"
-                f"💪 Тренировок: {saved.get('workouts', 0)}\n\n"
-                f"_Анализирую данные..._"
-            )
+            anomalies = parsed.get('anomalies', [])
+            dr = parsed.get('date_range') or {}
+            total_days = parsed.get('total_days', 0)
+
+            msg_lines = [
+                f"📦 *Apple Health: {dr.get('from', '?')} — {dr.get('to', '?')}*",
+                f"Дней с данными: {total_days}",
+                f"Тренировок: {len(parsed.get('workouts', []))}",
+            ]
+            if parsed.get('height'):
+                msg_lines.append(f"Рост: {round(parsed['height'])} см")
+
+            if anomalies:
+                msg_lines.append(f"\n⚠️ *Найдено {len(anomalies)} подозрительных значений:*")
+                for a in anomalies[:15]:
+                    msg_lines.append(f"  {a['date']}: {a['reason']}")
+                if len(anomalies) > 15:
+                    msg_lines.append(f"  ... и ещё {len(anomalies) - 15}")
+                msg_lines.append("\nУдалить эти аномалии? Напиши *да* или *оставить*.")
+                context.user_data['pending_apple_health'] = parsed
+            else:
+                msg_lines.append("\n✅ Аномалий не найдено.")
+                saved = save_apple_health_data(user_id, parsed, db, remove_anomalies=False)
+                msg_lines.append(
+                    f"⚖️ Вес: {saved.get('weight', 0)} | 👟 Активность: {saved.get('activity', 0)} | "
+                    f"💤 Сон: {saved.get('sleep', 0)} | 💪 Тренировки: {saved.get('workouts', 0)}"
+                )
+            msg_lines.append("\n_Пришли ещё файлы или /analyze когда закончишь._")
+
+            text = "\n".join(msg_lines)
             try:
-                await update.message.reply_text(msg, parse_mode="Markdown")
+                await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_keyboard())
             except Exception:
-                await update.message.reply_text(msg)
-
-            await update.message.reply_text(
-                "Можешь прислать ещё файлы или напиши *«проанализируй»* — "
-                "когда закончишь импорт, запущу анализ всех данных одним запросом.",
-                parse_mode="Markdown",
-                reply_markup=main_keyboard()
-            )
+                await update.message.reply_text(text, reply_markup=main_keyboard())
             return
 
         elif name.endswith('.csv') or 'csv' in mime:
             await update.message.reply_text("📊 Парсю FatSecret CSV...")
             try:
-                result = import_fatsecret_csv(user_id, file_bytes, db, months_limit=12)
+                parsed = parse_fatsecret_csv(file_bytes, months_limit=12)
             except Exception as e:
                 logger.error(f"FatSecret import error: {e}")
-                await update.message.reply_text(f"Ошибка импорта: {e}", reply_markup=main_keyboard())
+                await update.message.reply_text(f"Ошибка: {e}", reply_markup=main_keyboard())
                 return
+
+            if parsed.get('error'):
+                await update.message.reply_text(f"❌ {parsed['error']}", reply_markup=main_keyboard())
+                return
+
+            valid_days = parsed.get('valid_days', {})
+            skipped = parsed.get('skipped_days', [])
+
+            msg_lines = [
+                f"📊 *FatSecret CSV*",
+                f"Всего строк: {parsed.get('total_rows', 0)}",
+                f"✅ Валидных дней (1700-2700 ккал): {len(valid_days)}",
+            ]
+
+            if skipped:
+                msg_lines.append(f"\n⚠️ *Дни вне диапазона ({len(skipped)}):*")
+                for s in skipped[:20]:
+                    msg_lines.append(f"  {s['date']}: {s['total_cal']} ккал")
+                if len(skipped) > 20:
+                    msg_lines.append(f"  ... и ещё {len(skipped) - 20}")
+                msg_lines.append("\nУдалить эти дни как недостоверные? Напиши *да* или *оставить*.")
+                context.user_data['pending_fatsecret'] = parsed
+            else:
+                saved = save_fatsecret_data(user_id, parsed, db)
+                msg_lines.append(
+                    f"\n🍽 Записано приёмов: {saved['saved_meals']}\n"
+                    f"📦 Продуктов в базе: {saved['saved_products']}"
+                )
+
+            msg_lines.append("\n_Пришли ещё файлы или /analyze когда закончишь._")
+
+            text = "\n".join(msg_lines)
+            try:
+                await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_keyboard())
+            except Exception:
+                await update.message.reply_text(text, reply_markup=main_keyboard())
+            return
 
             if result.get('error'):
                 await update.message.reply_text(f"❌ {result['error']}", reply_markup=main_keyboard())
@@ -592,46 +641,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """All text messages go to Claude with full context and history"""
     user_id = update.effective_user.id
     text = update.message.text
-
-    # Import confirmation
-    pending = context.user_data.get('pending_import')
-    if pending:
-        text_lower = text.lower().strip()
-        if text_lower in ('да', 'yes', 'ок', 'окей', 'импортируй', 'давай', 'погнали'):
-            context.user_data.pop('pending_import', None)
-            await update.message.reply_text("⏳ Импортирую...")
-            try:
-                if pending['type'] == 'apple_health':
-                    result = import_apple_health_zip(user_id, pending['bytes'], db, dry_run=False)
-                    saved = result.get('saved', {})
-                    skipped = result.get('skipped', {})
-                    msg = (
-                        f"✅ *Apple Health импортирован!*\n"
-                        f"⚖️ Замеров веса: {saved.get('weight', 0)} (пропущено {skipped.get('weight', 0)})\n"
-                        f"👟 Дней с шагами: {saved.get('activity', 0)} (пропущено {skipped.get('steps', 0)})\n"
-                        f"💤 Дней со сном: {saved.get('sleep', 0)} (пропущено {skipped.get('sleep', 0)})\n"
-                        f"💪 Тренировок: {saved.get('workouts', 0)}"
-                    )
-                else:
-                    result = import_fatsecret_csv(user_id, pending['bytes'], db, months_limit=12, dry_run=False)
-                    msg = (
-                        f"✅ *FatSecret импортирован!*\n"
-                        f"🍽 Записано приёмов пищи: {result.get('saved_meals', 0)}\n"
-                        f"📦 Добавлено продуктов: {result.get('saved_products', 0)}"
-                    )
-                msg += "\n\nПришли ещё файлы или напиши /analyze когда закончишь."
-                try:
-                    await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=main_keyboard())
-                except Exception:
-                    await update.message.reply_text(msg, reply_markup=main_keyboard())
-            except Exception as e:
-                logger.error(f"Import error: {e}")
-                await update.message.reply_text(f"Ошибка импорта: {e}", reply_markup=main_keyboard())
-            return
-        elif text_lower in ('отмена', 'нет', 'no', 'не надо', 'cancel'):
-            context.user_data.pop('pending_import', None)
-            await update.message.reply_text("Импорт отменён.", reply_markup=main_keyboard())
-            return
 
     # Buttons
     if text == "📋 План дня":
