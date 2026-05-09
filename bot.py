@@ -1,0 +1,1261 @@
+"""
+Fitness Bot — simplified version.
+Single chat interface with full context to Claude.
+No conversation handlers, no state machines — Claude handles everything.
+"""
+import logging
+import os
+import json
+import tempfile
+import asyncio
+from datetime import datetime, date, timedelta, time as dtime
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, filters, ContextTypes
+)
+from database import Database
+from ai_handler import AIHandler
+from monitor import ProactiveMonitor
+from data_import import (
+    parse_apple_health_zip, save_apple_health_data,
+    parse_fatsecret_csv, save_fatsecret_data
+)
+from analytics import (
+    generate_weight_chart, generate_kbju_chart, generate_correlation_chart
+)
+
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+
+db = Database()
+ai = AIHandler(ANTHROPIC_API_KEY)
+
+
+def main_keyboard():
+    return ReplyKeyboardMarkup([
+        [KeyboardButton("📋 План дня"), KeyboardButton("📅 План недели")],
+    ], resize_keyboard=True)
+
+def _md_escape(text: str) -> str:
+    """Escape markdown special chars in user content"""
+    if not isinstance(text, str):
+        return str(text)
+    # Escape characters that break Telegram markdown
+    return text.replace('_', r'\_').replace('*', r'\*').replace('[', r'\[').replace('`', r'\`')
+
+
+# ============= COMMANDS =============
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    name = update.effective_user.first_name
+    db.ensure_user(user_id)
+
+    plan = db.get_nutrition_plan(user_id)
+    if not plan:
+        await update.message.reply_text(
+            f"Привет, {name}! 👋\n\n"
+            "Я твой персональный фитнес-тренер.\n\n"
+            "📸 Принимаю фото еды, скрины FatSecret, отчёты InBody (фото или PDF)\n"
+            "🎤 Понимаю голосовые\n"
+            "💬 Веду план питания, тренировок, таблеток и задач\n\n"
+            "Чтобы начать — расскажи о себе: пол, возраст, рост, вес, цель. "
+            "Можешь скинуть отчёт InBody — будет точнее.",
+            reply_markup=main_keyboard()
+        )
+    else:
+        await update.message.reply_text(
+            f"С возвращением, {name}! 💪",
+            reply_markup=main_keyboard()
+        )
+
+
+
+async def import_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show import options"""
+    await update.message.reply_text(
+        "📥 *Импорт исторических данных*\n\n"
+        "Используй команды:\n"
+        "📦 /import\_health — Apple Health ZIP\n"
+        "📊 /import\_food — FatSecret CSV (можно несколько за раз)\n\n"
+        "После импорта напиши /show\_data чтобы посмотреть что в базе.\n"
+        "Когда закончишь — /analyze для анализа аномалий.",
+        parse_mode="Markdown",
+        reply_markup=main_keyboard()
+    )
+
+async def import_health_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['waiting_import'] = 'health'
+    await update.message.reply_text(
+        "📦 Жду Apple Health ZIP. Выгрузи в приложении Здоровье → "
+        "значок профиля → Экспортировать данные.",
+        reply_markup=main_keyboard()
+    )
+
+async def import_food_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['waiting_import'] = 'food'
+    context.user_data.pop('pending_fatsecret', None)
+    context.user_data['fatsecret_buffer'] = []
+    await update.message.reply_text(
+        "📊 Жду FatSecret CSV. Можно несколько файлов подряд — "
+        "после каждого пиши «дальше», когда все загрузил — пиши «готово».\n"
+        "После этого покажу что распознал и спрошу что удалить.",
+        reply_markup=main_keyboard()
+    )
+
+async def show_data_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show what's in the database without AI"""
+    user_id = update.effective_user.id
+    summary = db.get_import_summary(user_id) or {}
+    monthly = db.get_monthly_aggregates(user_id, months=12) or []
+
+    lines = ["📊 *Что в базе:*\n"]
+    lines.append(f"📅 Дней с приёмами пищи: {summary.get('meal_days', 0)}")
+    lines.append(f"⚖️ Замеров веса: {summary.get('weight_records', 0)}")
+    lines.append(f"📦 Продуктов в базе: {summary.get('products_in_base', 0)}")
+
+    if summary.get('meal_range'):
+        mr = summary['meal_range']
+        if mr[0]:
+            lines.append(f"\n🍽 Питание: {mr[0]} — {mr[1]}")
+    if summary.get('weight_range'):
+        wr = summary['weight_range']
+        if wr[0]:
+            lines.append(f"⚖️ Вес: {wr[0]} — {wr[1]}")
+
+    # Top products
+    products = db.get_products_summary(user_id) or {}
+    always = products.get('always', [])
+    frequent = products.get('frequent', [])
+    oneoff = products.get('oneoff', [])
+
+    if always or frequent:
+        lines.append("\n*Топ продуктов:*")
+        for p in (always + frequent)[:15]:
+            line = f"  {p['name']} (×{p['count']})"
+            if p.get('kcal_100g'):
+                line += f" — {p['kcal_100g']} ккал/100г"
+            if p.get('portion_g'):
+                line += f", порция {p['portion_g']}г"
+            lines.append(line)
+    elif oneoff:
+        lines.append(f"\n*Продуктов в базе:* {len(oneoff)} (показываю топ 10):")
+        for p in oneoff[:10]:
+            line = f"  {p['name']}"
+            if p.get('kcal_100g'):
+                line += f" — {p['kcal_100g']} ккал/100г"
+            lines.append(line)
+
+    if monthly:
+        lines.append("\n*По месяцам:*")
+        for m in monthly[-6:]:
+            mw = round(m.get('avg_weight') or 0, 1) if m.get('avg_weight') else '?'
+            mc = round(m.get('avg_cal') or 0)
+            lines.append(f"  {m['month']}: {mc} ккал/день, вес {mw}кг ({m['days']} дн)")
+
+    text = "\n".join(lines)
+    try:
+        await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_keyboard())
+    except Exception:
+        await update.message.reply_text(text, reply_markup=main_keyboard())
+
+
+async def show_day_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show today's plan as text"""
+    user_id = update.effective_user.id
+    today_str = date.today().isoformat()
+
+    day_plan = db.get_effective_day_plan(user_id)
+    totals = db.get_today_totals(user_id) or {}
+    meals_eaten = db.get_today_meals(user_id) or []
+    plan = db.get_nutrition_plan(user_id) or {}
+    supps = db.get_supplements(user_id) or []
+    taken = db.get_supplements_taken_today(user_id) or []
+    tasks = db.get_tasks_today(user_id) or []
+    done_ids = db.get_tasks_done_today(user_id) or []
+    weight = db.get_latest_weight(user_id)
+    activity = db.get_today_activity(user_id) or {}
+
+    days_ru = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
+    today_name = days_ru[datetime.now().weekday()]
+
+    lines = [f"📋 *План на {today_name}, {datetime.now().strftime('%d.%m')}*\n"]
+
+    # Stats
+    if weight:
+        lines.append(f"⚖️ Вес: {weight} кг")
+    if activity.get('steps'):
+        lines.append(f"👟 Шаги: {activity['steps']:,}")
+
+    # Macros
+    cal = totals.get('calories', 0)
+    plan_cal = plan.get('calories', 0)
+    if plan_cal:
+        pct = int(cal / plan_cal * 100)
+        bar_len = 12
+        filled = min(bar_len, int(pct / 100 * bar_len))
+        bar = "█" * filled + "░" * (bar_len - filled)
+        lines.append(f"\n🔥 *{cal} / {plan_cal} ккал* ({pct}%)")
+        lines.append(f"`{bar}`")
+        lines.append(
+            f"Б: {totals.get('protein',0)}/{plan.get('protein',0)}г · "
+            f"Ж: {totals.get('fat',0)}/{plan.get('fat',0)}г · "
+            f"У: {totals.get('carbs',0)}/{plan.get('carbs',0)}г"
+        )
+
+    # Today's planned meals (from template/override)
+    if day_plan and day_plan.get('meals'):
+        lines.append("\n🍽 *Запланировано:*")
+        for m in day_plan['meals']:
+            lines.append(
+                f"  {m.get('time','--:--')} {_md_escape(m.get('name',''))} — "
+                f"{m.get('calories',0)} ккал"
+            )
+
+    # Today's workout
+    if day_plan and day_plan.get('workout'):
+        w = day_plan['workout']
+        lines.append(f"\n💪 *Тренировка:* {w.get('name','')} в {w.get('time','--:--')}")
+
+    # Eaten today
+    if meals_eaten:
+        lines.append("\n✅ *Съедено:*")
+        for m in meals_eaten:
+            lines.append(f"  {m['time']} {_md_escape(m['description'])} — {m['calories']} ккал")
+
+    # Supplements
+    if supps:
+        lines.append("\n💊 *Таблетки:*")
+        for s in supps:
+            tick = "✅" if s['id'] in taken else "⬜"
+            time_str = f" {s['time_of_day']}" if s.get('time_of_day') else ""
+            lines.append(f"{tick} {_md_escape(s['name'])} {_md_escape(s['dose'])}{time_str}")
+
+    # Tasks
+    if tasks:
+        lines.append("\n📌 *Задачи:*")
+        for t in tasks:
+            tick = "✅" if t['id'] in done_ids else "⬜"
+            time_str = f" {t['time_str']}" if t.get('time_str') else ""
+            lines.append(f"{tick} {_md_escape(t['title'])}{time_str}")
+
+    if not (meals_eaten or supps or tasks or (day_plan and day_plan.get('meals'))):
+        lines.append("\n_План пустой. Расскажи боту что съел, что планируешь, что нужно сделать._")
+
+    text = "\n".join(lines)
+    try:
+        await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_keyboard())
+    except Exception:
+        await update.message.reply_text(text, reply_markup=main_keyboard())
+
+
+async def show_week_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show weekly template"""
+    user_id = update.effective_user.id
+    template = db.get_weekly_template(user_id)
+    days = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+    days_ru = {"monday": "Пн", "tuesday": "Вт", "wednesday": "Ср",
+               "thursday": "Чт", "friday": "Пт", "saturday": "Сб", "sunday": "Вс"}
+
+    if not template:
+        await update.message.reply_text(
+            "Недельный шаблон не составлен.\n\n"
+            "Напиши боту: «составь шаблон недели» — он спросит детали и сохранит.",
+            reply_markup=main_keyboard()
+        )
+        return
+
+    today = date.today()
+    today_idx = datetime.now().weekday()
+    lines = ["📅 *Шаблон недели*\n"]
+
+    for i, day in enumerate(days):
+        delta = (i - today_idx) % 7
+        day_date = today + timedelta(days=delta)
+        override = db.get_day_override(user_id, day_date.isoformat())
+        # Use override if exists, else template
+        d = override if override else template.get(day, {})
+        if not d:
+            continue
+        meals = d.get('meals', [])
+        workout = d.get('workout')
+        total_cal = sum(m.get('calories', 0) for m in meals)
+
+        marker = "🔄" if override else ""
+        is_today = "👉" if i == today_idx else " "
+
+        wstr = f" 💪 {_md_escape(workout.get('name', ''))}" if workout else ""
+        lines.append(f"{is_today}{marker} *{days_ru[day]}*: {total_cal} ккал{wstr}")
+
+    lines.append("\n_🔄 — день изменён на сегодня. На следующей неделе вернётся базовый план._")
+    lines.append("_Чтобы пересоставить шаблон — напиши «обнови шаблон недели»_")
+
+    text = "\n".join(lines)
+    try:
+        await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_keyboard())
+    except Exception:
+        await update.message.reply_text(text, reply_markup=main_keyboard())
+
+
+async def show_analytics(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show analytics with charts"""
+    user_id = update.effective_user.id
+    plan = db.get_nutrition_plan(user_id)
+    if not plan:
+        await update.message.reply_text(
+            "Сначала настрой план — расскажи боту о себе и целях.",
+            reply_markup=main_keyboard()
+        )
+        return
+
+    await update.message.reply_text("⏳ Собираю данные и строю графики...")
+    week_data = db.get_week_stats(user_id)
+    month_data = db.get_month_stats(user_id)
+    weight_history = db.get_weight_history(user_id, days=30)
+    activity_data = db.get_activity_history(user_id, days=30)
+
+    analysis = await ai.generate_text_analytics(
+        period='month',
+        week_data=week_data,
+        month_data=month_data,
+        plan=plan,
+        weight_history=weight_history,
+        activity_data=activity_data,
+    )
+    await update.message.reply_text(
+        f"📈 *Аналитика за месяц*\n\n{analysis}",
+        parse_mode="Markdown"
+    )
+
+    if weight_history:
+        chart = generate_weight_chart(weight_history, "месяц")
+        if chart:
+            import io
+            await update.message.reply_photo(
+                photo=io.BytesIO(chart),
+                caption=f"📉 Вес за месяц"
+            )
+
+    if month_data:
+        kbju_chart = generate_kbju_chart(month_data, plan)
+        if kbju_chart:
+            import io
+            await update.message.reply_photo(
+                photo=io.BytesIO(kbju_chart),
+                caption="🍽 КБЖУ по дням"
+            )
+
+    if len(weight_history) >= 5 and month_data:
+        corr_chart = generate_correlation_chart(weight_history, month_data, activity_data)
+        if corr_chart:
+            import io
+            await update.message.reply_photo(
+                photo=io.BytesIO(corr_chart),
+                caption="🔗 Корреляции"
+            )
+
+
+# ============= MEDIA HANDLERS =============
+
+_photo_buffers = {}  # user_id -> {"photos": [bytes,...], "task": asyncio.Task, "message_ids": [...]}
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Buffer photos for 3 seconds — process all together if user sends multiple"""
+    user_id = update.effective_user.id
+
+    photo = update.message.photo[-1]
+    file = await context.bot.get_file(photo.file_id)
+    photo_bytes = bytes(await file.download_as_bytearray())
+
+    # Get or create buffer for this user
+    buf = _photo_buffers.get(user_id)
+    if buf is None:
+        buf = {"photos": [], "task": None, "first_update": update}
+        _photo_buffers[user_id] = buf
+
+    buf["photos"].append(photo_bytes)
+
+    # Cancel previous waiting task if exists
+    if buf.get("task") and not buf["task"].done():
+        buf["task"].cancel()
+
+    # Schedule processing after 3-second pause
+    async def delayed_process():
+        try:
+            await asyncio.sleep(3)
+            current_buf = _photo_buffers.pop(user_id, None)
+            if not current_buf or not current_buf["photos"]:
+                return
+            photos = current_buf["photos"]
+            first_upd = current_buf["first_update"]
+
+            if len(photos) == 1:
+                await first_upd.message.reply_text("📸 Анализирую...")
+                await _process_image(first_upd, context, photos[0])
+            else:
+                await first_upd.message.reply_text(f"📸 Анализирую {len(photos)} фото вместе...")
+                await _process_multi_images(first_upd, context, photos)
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.error(f"Photo buffer error: {e}")
+
+    buf["task"] = asyncio.create_task(delayed_process())
+
+
+async def _process_multi_images(update: Update, context: ContextTypes.DEFAULT_TYPE, images: list):
+    """Process multiple images together - useful for FatSecret day screenshots"""
+    user_id = update.effective_user.id
+    full_context = _build_full_context(user_id)
+    result = await ai.analyze_multi_images(images, full_context)
+    if not result:
+        await update.message.reply_text(
+            "Не смог проанализировать фото 🤔",
+            reply_markup=main_keyboard()
+        )
+        return
+    await _execute_intent(update, context, result)
+
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """PDF, image, ZIP, CSV documents"""
+    user_id = update.effective_user.id
+    doc = update.message.document
+    if not doc:
+        return
+
+    mime = doc.mime_type or ""
+    name = (doc.file_name or "").lower()
+
+    # Auto-detect file types
+    is_zip = name.endswith('.zip') or 'zip' in mime
+    is_csv = name.endswith('.csv') or 'csv' in mime
+    waiting = context.user_data.get('waiting_import')
+
+    if waiting or is_zip or is_csv:
+        if waiting == 'health' and not is_zip:
+            await update.message.reply_text("Ожидаю ZIP, а не CSV.", reply_markup=main_keyboard())
+            return
+        if waiting == 'food' and not is_csv:
+            await update.message.reply_text("Ожидаю CSV.", reply_markup=main_keyboard())
+            return
+
+        await update.message.reply_text("📥 Загружаю файл...")
+        file = await context.bot.get_file(doc.file_id)
+        file_bytes = bytes(await file.download_as_bytearray())
+
+        if name.endswith('.zip') or 'zip' in mime:
+            await update.message.reply_text("📦 Парсю Apple Health (1-2 минуты)...")
+            try:
+                parsed = parse_apple_health_zip(file_bytes)
+            except Exception as e:
+                logger.error(f"Apple Health import error: {e}")
+                await update.message.reply_text(f"Ошибка: {e}", reply_markup=main_keyboard())
+                return
+
+            if parsed.get('error'):
+                await update.message.reply_text(f"❌ {parsed['error']}", reply_markup=main_keyboard())
+                return
+
+            anomalies = parsed.get('anomalies', [])
+            dr = parsed.get('date_range') or {}
+            total_days = parsed.get('total_days', 0)
+
+            msg_lines = [
+                f"📦 *Apple Health: {dr.get('from', '?')} — {dr.get('to', '?')}*",
+                f"Дней с данными: {total_days}",
+                f"Тренировок: {len(parsed.get('workouts', []))}",
+            ]
+            if parsed.get('height'):
+                msg_lines.append(f"Рост: {round(parsed['height'])} см")
+
+            if anomalies:
+                msg_lines.append(f"\n⚠️ *Найдено {len(anomalies)} подозрительных значений:*")
+                for a in anomalies[:15]:
+                    msg_lines.append(f"  {a['date']}: {a['reason']}")
+                if len(anomalies) > 15:
+                    msg_lines.append(f"  ... и ещё {len(anomalies) - 15}")
+                msg_lines.append("\nУдалить эти аномалии? Напиши *да* или *оставить*.")
+                context.user_data['pending_apple_health'] = parsed
+            else:
+                msg_lines.append("\n✅ Аномалий не найдено.")
+                saved = save_apple_health_data(user_id, parsed, db, remove_anomalies=False)
+                msg_lines.append(
+                    f"⚖️ Вес: {saved.get('weight', 0)} | 👟 Активность: {saved.get('activity', 0)} | "
+                    f"💤 Сон: {saved.get('sleep', 0)} | 💪 Тренировки: {saved.get('workouts', 0)}"
+                )
+            msg_lines.append("\n_Пришли ещё файлы или /analyze когда закончишь._")
+
+            text = "\n".join(msg_lines)
+            try:
+                await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_keyboard())
+            except Exception:
+                await update.message.reply_text(text, reply_markup=main_keyboard())
+            return
+
+        elif is_csv:
+            await update.message.reply_text("📊 Парсю CSV...")
+            try:
+                parsed = parse_fatsecret_csv(file_bytes, months_limit=12)
+            except Exception as e:
+                logger.error(f"FatSecret import error: {e}")
+                await update.message.reply_text(f"Ошибка: {e}", reply_markup=main_keyboard())
+                return
+
+            if parsed.get('error'):
+                await update.message.reply_text(f"❌ {parsed['error']}", reply_markup=main_keyboard())
+                return
+
+            # If user explicitly used /import_food - buffer mode
+            if waiting == 'food':
+                buf = context.user_data.setdefault('fatsecret_buffer', [])
+                buf.append(parsed)
+                valid_days = parsed.get('valid_days', {})
+                skipped = parsed.get('skipped_days', [])
+                await update.message.reply_text(
+                    f"✅ Файл #{len(buf)}: {len(valid_days)} валидных дней, "
+                    f"{len(skipped)} вне диапазона.\n"
+                    f"Пришли ещё файлы или напиши «готово».",
+                    reply_markup=main_keyboard()
+                )
+                return
+
+            # Else - auto mode - send to AI for plan vs fact decision
+            from datetime import date
+            valid_days = parsed.get('valid_days', {})
+            today_str = date.today().isoformat()
+            today_meals_in_csv = valid_days.get(today_str, [])
+            past_days = {d: m for d, m in valid_days.items() if d < today_str}
+            future_days = {d: m for d, m in valid_days.items() if d > today_str}
+
+            # Auto-process past days as facts
+            saved_past = 0
+            if past_days:
+                saved = save_fatsecret_data(user_id, {'valid_days': past_days, 'skipped_days': []}, db)
+                saved_past = saved.get('saved_meals', 0)
+
+            # Future days as plan_meal (added to day_overrides)
+            saved_future = 0
+            for d, meals in future_days.items():
+                try:
+                    existing = db.get_day_override(user_id, d) or {}
+                    plan_meals = existing.get('meals', [])
+                    for m in meals:
+                        plan_meals.append({
+                            'time': _get_meal_time_for_save(m.get('meal_type', '')),
+                            'name': m.get('product_name', ''),
+                            'calories': m['calories'],
+                            'protein': m['protein'],
+                            'fat': m['fat'],
+                            'carbs': m['carbs'],
+                        })
+                    existing['meals'] = plan_meals
+                    db.save_day_override(user_id, d, existing)
+                    saved_future += len(meals)
+                except Exception as e:
+                    logger.error(f"plan save: {e}")
+
+            # Today: pass to AI to decide plan vs fact
+            if today_meals_in_csv:
+                # Hand off to AI - construct text message
+                summary_lines = [f"Получил CSV с {len(today_meals_in_csv)} приёмами на сегодня:"]
+                total_cal = sum(m['calories'] for m in today_meals_in_csv)
+                summary_lines.append(f"всего {total_cal} ккал")
+                for m in today_meals_in_csv[:8]:
+                    summary_lines.append(f"  {m.get('meal_type','?')}: {m.get('product_name','')} {m.get('portion_g','')}г = {m['calories']} ккал")
+
+                msg = ""
+                if saved_past:
+                    msg += f"✅ Записал {saved_past} приёмов из прошлых дней.\n"
+                if saved_future:
+                    msg += f"📅 Записал {saved_future} приёмов в план будущих дней.\n"
+                msg += "\n".join(summary_lines)
+                msg += "\n\nЭто что ты уже съел сегодня или твой план?"
+
+                # Stash for AI to handle next response
+                context.user_data['pending_csv_today'] = today_meals_in_csv
+                await update.message.reply_text(msg, reply_markup=main_keyboard())
+            else:
+                msg = ""
+                if saved_past:
+                    msg += f"✅ Записал {saved_past} приёмов из прошлых дней.\n"
+                if saved_future:
+                    msg += f"📅 Записал {saved_future} приёмов в план будущих дней."
+                if not msg:
+                    msg = "В CSV нет валидных данных за сегодня/будущее/прошлое."
+                await update.message.reply_text(msg, reply_markup=main_keyboard())
+            return
+
+            if result.get('error'):
+                await update.message.reply_text(f"❌ {result['error']}", reply_markup=main_keyboard())
+                return
+
+            msg = (
+                f"✅ *FatSecret импортирован!*\n\n"
+                f"📋 Строк обработано: {result.get('parsed_rows', 0)}\n"
+                f"✅ Дней с валидными данными: {result.get('valid_days', 0)}\n"
+                f"⚠️ Отфильтровано (вне 1700-2700 ккал): {result.get('skipped_days_out_of_range', 0)}\n"
+                f"🍽 Записано приёмов пищи: {result.get('saved_meals', 0)}\n"
+                f"📦 Добавлено продуктов в базу: {result.get('saved_products', 0)}\n\n"
+                f"_Анализирую данные..._"
+            )
+            try:
+                await update.message.reply_text(msg, parse_mode="Markdown")
+            except Exception:
+                await update.message.reply_text(msg)
+
+            await update.message.reply_text(
+                "Можешь прислать ещё файлы или напиши *«проанализируй»* — "
+                "когда закончишь импорт, запущу анализ всех данных одним запросом.",
+                parse_mode="Markdown",
+                reply_markup=main_keyboard()
+            )
+            return
+
+    if "pdf" not in mime and "image" not in mime:
+        await update.message.reply_text(
+            "Умею читать только PDF и изображения. "
+            "Скинь скриншот или фото.",
+            reply_markup=main_keyboard()
+        )
+        return
+
+    await update.message.reply_text("📄 Читаю файл...")
+    file = await context.bot.get_file(doc.file_id)
+    file_bytes = bytes(await file.download_as_bytearray())
+
+    if "pdf" in mime:
+        try:
+            import fitz
+            pdf_doc = fitz.open(stream=file_bytes, filetype="pdf")
+            page = pdf_doc[0]
+            mat = fitz.Matrix(2, 2)
+            pix = page.get_pixmap(matrix=mat)
+            img_bytes = pix.tobytes("jpeg")
+            pdf_doc.close()
+        except Exception as e:
+            logger.error(f"PDF error: {e}")
+            await update.message.reply_text(
+                "Не смог прочитать PDF. Попробуй сделать скриншот.",
+                reply_markup=main_keyboard()
+            )
+            return
+    else:
+        img_bytes = file_bytes
+
+    await _process_image(update, context, img_bytes)
+
+
+
+
+async def analyze_history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Manually trigger AI analysis of imported historical data"""
+    await update.message.reply_text("🔍 Анализирую историю...")
+    await _post_import_analysis(update, context)
+
+
+async def _post_import_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Light-weight analysis using only aggregated data, not full context"""
+    user_id = update.effective_user.id
+    summary = db.get_import_summary(user_id) or {}
+    monthly = db.get_monthly_aggregates(user_id, months=24) or []
+
+    if not monthly:
+        await update.message.reply_text("Нет данных для анализа. Импортируй сначала.", reply_markup=main_keyboard())
+        return
+
+    # Build minimal context - no full history, just aggregates
+    profile = db.get_user_profile(user_id) or {}
+    plan = db.get_nutrition_plan(user_id) or {}
+
+    minimal_ctx = {
+        'profile': profile,
+        'nutrition_plan': plan,
+        'import_summary': summary,
+        'monthly_aggregates': monthly,
+    }
+
+    prompt = (
+        "Это импорт исторических данных. Посмотри monthly_aggregates "
+        "(средние калории и вес по месяцам). Найди 1-2 аномалии — резкие изменения веса "
+        "или калорий, и задай уточняющие вопросы. Если всё ровно — дай краткую оценку. "
+        "Будь кратким (3-5 предложений)."
+    )
+
+    try:
+        result = await ai.process_message(prompt, minimal_ctx, [])
+        await _execute_intent(update, context, result)
+    except Exception as e:
+        logger.error(f"Post-import analysis error: {e}")
+        await update.message.reply_text(
+            f"Ошибка анализа: {e}",
+            reply_markup=main_keyboard()
+        )
+
+
+async def _process_image(update: Update, context: ContextTypes.DEFAULT_TYPE, img_bytes: bytes):
+    """Unified image processing - Claude decides what it is"""
+    user_id = update.effective_user.id
+    full_context = _build_full_context(user_id)
+
+    result = await ai.analyze_image_unified(img_bytes, full_context)
+
+    if not result:
+        await update.message.reply_text(
+            "Не смог разобрать изображение 🤔 Попробуй текстом или другим фото.",
+            reply_markup=main_keyboard()
+        )
+        return
+
+    # Result contains intent + reply text
+    await _execute_intent(update, context, result)
+
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Transcribe and process as text"""
+    user_id = update.effective_user.id
+    await update.message.reply_text("🎤 Слушаю...")
+
+    try:
+        voice = update.message.voice
+        file = await context.bot.get_file(voice.file_id)
+        audio_bytes = await file.download_as_bytearray()
+
+        with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
+            tmp.write(audio_bytes)
+            tmp_path = tmp.name
+
+        text = await ai.transcribe_voice(tmp_path)
+        os.unlink(tmp_path)
+
+        if not text:
+            await update.message.reply_text(
+                "Не разобрал голосовое. Напиши текстом или попробуй ещё раз.",
+                reply_markup=main_keyboard()
+            )
+            return
+
+        await update.message.reply_text(f"🎤 _{text}_", parse_mode="Markdown")
+
+        # Process transcribed text directly via AI
+        if 'chat_history' not in context.user_data:
+            context.user_data['chat_history'] = []
+        context.user_data['chat_history'].append({"role": "user", "content": text})
+        if len(context.user_data['chat_history']) > 40:
+            context.user_data['chat_history'] = context.user_data['chat_history'][-40:]
+
+        full_context = _build_full_context(user_id)
+        chat_history = context.user_data['chat_history']
+
+        await update.message.chat.send_action("typing")
+        try:
+            result = await ai.process_message(text, full_context, chat_history[:-1])
+        except Exception as e:
+            logger.error(f"AI error: {e}")
+            await update.message.reply_text(
+                "Что-то пошло не так. Попробуй ещё раз.",
+                reply_markup=main_keyboard()
+            )
+            return
+
+        await _execute_intent(update, context, result)
+    except Exception as e:
+        logger.error(f"Voice error: {e}")
+        await update.message.reply_text(
+            "Ошибка обработки голосового.",
+            reply_markup=main_keyboard()
+        )
+
+
+# ============= TEXT HANDLER =============
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """All text messages go to Claude with full context and history"""
+    user_id = update.effective_user.id
+    text = update.message.text
+
+    # Buttons
+    if text == "📋 План дня":
+        await show_day_plan(update, context)
+        return
+    if text == "📅 План недели":
+        await show_week_plan(update, context)
+        return
+
+
+    # Maintain chat history (40 messages = 20 exchanges)
+    if 'chat_history' not in context.user_data:
+        context.user_data['chat_history'] = []
+    context.user_data['chat_history'].append({"role": "user", "content": text})
+    if len(context.user_data['chat_history']) > 40:
+        context.user_data['chat_history'] = context.user_data['chat_history'][-40:]
+
+    full_context = _build_full_context(user_id)
+    chat_history = context.user_data['chat_history']
+
+    await update.message.chat.send_action("typing")
+
+    try:
+        result = await ai.process_message(text, full_context, chat_history[:-1])
+    except Exception as e:
+        logger.error(f"AI error: {e}")
+        await update.message.reply_text(
+            "Что-то пошло не так. Попробуй ещё раз.",
+            reply_markup=main_keyboard()
+        )
+        return
+
+    await _execute_intent(update, context, result)
+
+
+async def _execute_intent(update: Update, context: ContextTypes.DEFAULT_TYPE, result: dict):
+    """Execute actions returned by Claude and send reply"""
+    user_id = update.effective_user.id
+    actions = result.get('actions', [])
+    reply = result.get('reply', '')
+
+    # Execute all actions
+    for action in actions:
+        atype = action.get('type')
+        data = action.get('data', {})
+
+        try:
+            if atype == 'meal':
+                db.log_meal_with_meal_type(user_id, data,
+                    date_str=data.get('date'),
+                    time_str=data.get('time'))
+                if data.get('product_name') or data.get('description'):
+                    db.add_or_update_product(user_id, data)
+
+            elif atype == 'update_meal':
+                meal_id = data.get('meal_id')
+                if meal_id:
+                    try:
+                        with db._conn() as conn:
+                            updates = []
+                            params = []
+                            for f in ('calories', 'protein', 'fat', 'carbs', 'portion_g'):
+                                if f in data:
+                                    updates.append(f"{f}=?")
+                                    params.append(data[f])
+                            if updates:
+                                params.append(meal_id)
+                                params.append(user_id)
+                                conn.execute(
+                                    f"UPDATE meal_logs SET {', '.join(updates)} WHERE id=? AND user_id=?",
+                                    params
+                                )
+                    except Exception as e:
+                        logger.error(f"update_meal: {e}")
+
+            elif atype == 'delete_meal':
+                meal_id = data.get('meal_id')
+                if meal_id:
+                    try:
+                        with db._conn() as conn:
+                            conn.execute(
+                                "DELETE FROM meal_logs WHERE id=? AND user_id=?",
+                                (meal_id, user_id)
+                            )
+                    except Exception as e:
+                        logger.error(f"delete_meal: {e}")
+
+            elif atype == 'meals_replace_today':
+                # Used when user sends a full day report from FatSecret
+                db.clear_today_meals(user_id)
+                for m in data.get('meals', []):
+                    db.log_meal(user_id, m)
+                    if m.get('description'):
+                        db.add_or_update_product(user_id, m)
+
+            elif atype == 'plan_meal':
+                # Add meal to today's plan (override)
+                today_str = date.today().isoformat()
+                override = db.get_day_override(user_id, today_str) or db.get_effective_day_plan(user_id) or {}
+                override = dict(override)
+                meals = list(override.get('meals', []))
+                meals.append(data)
+                override['meals'] = meals
+                db.save_day_override(user_id, today_str, override)
+
+            elif atype == 'workout':
+                db.log_workout(user_id, data)
+
+            elif atype == 'weight':
+                db.log_weight(user_id, data['weight'])
+
+            elif atype == 'activity':
+                db.log_activity(user_id, data)
+
+            elif atype == 'sleep':
+                db.log_sleep(user_id, data.get('hours', 0), data.get('quality'))
+
+            elif atype == 'add_supplement':
+                db.save_supplement(
+                    user_id,
+                    name=data.get('name', ''),
+                    dose=data.get('dose', ''),
+                    timing=data.get('timing', 'independent'),
+                    time_of_day=data.get('time_of_day')
+                )
+
+            elif atype == 'mark_supplement_taken':
+                # Find supplement by name
+                supps = db.get_supplements(user_id)
+                for s in supps:
+                    if s['name'].lower() == data.get('name', '').lower():
+                        db.log_supplement_taken(user_id, s['id'])
+                        break
+
+            elif atype == 'add_task':
+                db.save_task(user_id, data.get('title', ''), data.get('time_str'), data.get('repeat', 'none'))
+
+            elif atype == 'mark_task_done':
+                tasks = db.get_tasks_today(user_id)
+                for t in tasks:
+                    if t['title'].lower() == data.get('title', '').lower():
+                        db.log_task_done(user_id, t['id'])
+                        break
+
+            elif atype == 'update_nutrition_plan':
+                db.save_nutrition_plan(user_id, data, is_base=True)
+
+            elif atype == 'update_profile':
+                db.save_user_profile(user_id, data)
+                if data.get('weight'):
+                    db.log_weight(user_id, data['weight'])
+
+            elif atype == 'update_day_today':
+                # Edit only today's plan (override)
+                today_str = date.today().isoformat()
+                db.save_day_override(user_id, today_str, data)
+
+            elif atype == 'update_day_for_date':
+                # Edit specific future day (within current week or next few days)
+                target_date = data.get('date')
+                day_data = data.get('plan') or data.get('day_plan') or {}
+                if target_date:
+                    db.save_day_override(user_id, target_date, day_data)
+
+            elif atype == 'update_weekly_template':
+                # Update full week template (only with explicit user permission)
+                db.save_weekly_template(user_id, data)
+
+            elif atype == 'save_inbody':
+                db.save_inbody(user_id, data)
+
+            elif atype == 'add_product':
+                db.add_or_update_product(user_id, data)
+
+            elif atype == 'mark_product_always':
+                db.mark_product_group(user_id, data.get('name', ''), 'always')
+
+            elif atype == 'mark_product_frequent':
+                db.mark_product_group(user_id, data.get('name', ''), 'frequent')
+
+            elif atype == 'mark_product_oneoff':
+                db.mark_product_group(user_id, data.get('name', ''), 'oneoff')
+
+            elif atype == 'set_workout_schedule':
+                db.save_workout_schedule(user_id, data)
+
+        except Exception as e:
+            logger.error(f"Action {atype} error: {e}")
+
+    # Save assistant reply to history
+    if reply:
+        if 'chat_history' in context.user_data:
+            context.user_data['chat_history'].append({"role": "assistant", "content": reply})
+        await _send_long_message(update, reply, main_keyboard())
+
+        # Lazy evening summary - mark as done if AI integrated it
+        from datetime import datetime
+        now_h = datetime.now().hour
+        if 22 <= now_h <= 23:
+            db.mark_summary_done(user_id, 'evening')
+        elif 17 <= now_h <= 18:
+            db.mark_summary_done(user_id, 'midday')
+
+
+async def _send_long_message(update: Update, text: str, reply_markup=None, max_length: int = 3500):
+    """Split long messages by paragraphs/lines to avoid Telegram's 4096 limit"""
+    if len(text) <= max_length:
+        try:
+            await update.message.reply_text(text, parse_mode="Markdown", reply_markup=reply_markup)
+        except Exception:
+            await update.message.reply_text(text, reply_markup=reply_markup)
+        return
+
+    # Split into chunks at paragraph boundaries
+    chunks = []
+    remaining = text
+    while len(remaining) > max_length:
+        # Try to split at paragraph
+        split_at = remaining.rfind("\n\n", 0, max_length)
+        if split_at < max_length // 2:
+            split_at = remaining.rfind("\n", 0, max_length)
+        if split_at < max_length // 2:
+            split_at = remaining.rfind(". ", 0, max_length)
+        if split_at < max_length // 2:
+            split_at = max_length
+        chunks.append(remaining[:split_at])
+        remaining = remaining[split_at:].lstrip()
+    if remaining:
+        chunks.append(remaining)
+
+    for i, chunk in enumerate(chunks):
+        is_last = (i == len(chunks) - 1)
+        try:
+            await update.message.reply_text(
+                chunk,
+                parse_mode="Markdown",
+                reply_markup=reply_markup if is_last else None
+            )
+        except Exception:
+            await update.message.reply_text(
+                chunk,
+                reply_markup=reply_markup if is_last else None
+            )
+
+
+# ============= CONTEXT BUILDER =============
+
+
+
+def _get_meal_time_for_save(meal_type: str) -> str:
+    """Map meal type to time"""
+    mt = (meal_type or '').lower()
+    if 'breakfast' in mt or 'завтрак' in mt:
+        return '09:00'
+    elif 'lunch' in mt or 'обед' in mt:
+        return '13:00'
+    elif 'dinner' in mt or 'ужин' in mt:
+        return '19:00'
+    elif 'snack' in mt or 'перекус' in mt:
+        return '16:00'
+    return '12:00'
+
+def _build_full_context(user_id: int) -> dict:
+    """Smart context — only essential data, sliced for token efficiency.
+
+    Strategy:
+    - Today's plan and meals: full detail
+    - Last 7 days: full meal detail
+    - 8-21 days: only daily KBJU totals
+    - Weight: smart sampling (14d full, 14-30 every 3d, 30-60 weekly, 60+ monthly)
+    - Top products only (always + frequent + 10 recent oneoff)
+    """
+    from datetime import date, timedelta
+    today_str = date.today().isoformat()
+
+    db.cleanup_old_overrides(user_id)
+
+    profile = db.get_user_profile(user_id) or {}
+    plan = db.get_nutrition_plan(user_id) or {}
+    weekly = db.get_weekly_template(user_id) or {}
+    effective_day = db.get_effective_day_plan(user_id) or {}
+    day_override = db.get_day_override(user_id, today_str)
+
+    today_totals = db.get_today_totals(user_id) or {}
+    today_meals = db.get_today_meals(user_id) or []
+
+    # Last 7 days detailed
+    recent_detailed = db.get_meals_recent_detailed(user_id, days=7)
+    # 8-21 days as daily totals only
+    older_totals = db.get_meals_daily_totals(user_id, days_from=8, days_to=21)
+
+    # Smart weight sampling
+    weight_history = db.get_weight_smart(user_id)
+
+    activity = db.get_today_activity(user_id) or {}
+    sleep = db.get_last_sleep(user_id)
+    inbody = db.get_latest_inbody(user_id)
+
+    supps = db.get_supplements(user_id) or []
+    supps_taken = db.get_supplements_taken_today(user_id) or []
+    tasks = db.get_tasks_today(user_id) or []
+    tasks_done = db.get_tasks_done_today(user_id) or []
+
+    # Products: only relevant
+    products_full = db.get_products_summary(user_id) or {}
+    products = {
+        'always': products_full.get('always', [])[:20],
+        'frequent': products_full.get('frequent', [])[:20],
+        'oneoff_recent': products_full.get('oneoff', [])[:10],
+    }
+
+    promotion_candidates = db.find_promotion_candidates(user_id) or []
+    future_overrides = db.get_future_overrides(user_id, days_ahead=7) or []
+
+    return {
+        'profile': profile,
+        'nutrition_plan': plan,
+        'weekly_template': weekly,
+        'today_override': day_override,
+        'effective_day_plan': effective_day,
+        'today_totals': today_totals,
+        'today_meals': today_meals,
+        'recent_meals_7d': recent_detailed,
+        'older_meals_8_21d_totals': older_totals,
+        'weight_history': weight_history,
+        'activity_today': activity,
+        'last_sleep': sleep,
+        'latest_inbody': inbody,
+        'supplements': supps,
+        'supplements_taken_today': supps_taken,
+        'tasks': tasks,
+        'tasks_done_today': tasks_done,
+        'products': products,
+        'promotion_candidates': promotion_candidates,
+        'future_overrides': future_overrides,
+    }
+
+
+# ============= MAIN =============
+
+def main():
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    monitor = ProactiveMonitor(db=db, ai=ai, bot=app.bot)
+    job_queue = app.job_queue
+
+    if job_queue:
+        job_queue.run_daily(
+            monitor.run_all_checks,
+            time=dtime(hour=20, minute=0),
+            name="daily_monitor"
+        )
+
+        async def morning_checkin(context):
+            today_str = date.today().isoformat()
+            users = db.get_all_users()
+            for user in users:
+                uid = user['user_id']
+                try:
+                    if db.get_morning_checkin_done(uid, today_str):
+                        continue
+                    template = db.get_weekly_template(uid)
+                    if not template:
+                        continue
+                    day_plan = db.get_effective_day_plan(uid)
+                    if not day_plan:
+                        continue
+
+                    days_ru = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
+                    today_ru = days_ru[datetime.now().weekday()]
+
+                    meals = day_plan.get('meals', [])
+                    workout = day_plan.get('workout')
+                    supps_today = db.get_supplements(uid)
+
+                    lines = [f"🌅 *Доброе утро! План на {today_ru}:*\n"]
+                    if workout:
+                        lines.append(f"💪 {workout.get('name','Тренировка')} в {workout.get('time','--:--')}")
+                    total_cal = sum(m.get('calories', 0) for m in meals)
+                    lines.append(f"\n🍽 *Питание ({total_cal} ккал):*")
+                    for m in meals:
+                        lines.append(f"  {m.get('time','--:--')} {m.get('name','')} — {m.get('calories',0)} ккал")
+                    if supps_today:
+                        lines.append("\n💊 *Таблетки:*")
+                        for s in supps_today:
+                            t = f" {s['time_of_day']}" if s.get('time_of_day') else ""
+                            lines.append(f"  {s['name']} {s['dose']}{t}")
+
+                    lines.append("\n_Что меняем на сегодня? Или напиши «всё по плану»_")
+
+                    await app.bot.send_message(
+                        chat_id=uid,
+                        text="\n".join(lines),
+                        parse_mode="Markdown"
+                    )
+                    db.save_morning_checkin_done(uid, today_str)
+                except Exception as e:
+                    logger.error(f"Morning checkin {uid}: {e}")
+
+        job_queue.run_daily(
+            morning_checkin,
+            time=dtime(hour=6, minute=0),
+            name="morning_checkin"
+        )
+
+        async def lazy_evening_summary(context):
+            """Only send evening summary if user wasn't active in chat 22:00-23:55"""
+            from datetime import datetime, timedelta
+            users = db.get_all_users()
+            for user in users:
+                uid = user['user_id']
+                try:
+                    if db.get_summary_done_today(uid, 'evening'):
+                        continue
+                    plan = db.get_nutrition_plan(uid)
+                    if not plan:
+                        continue
+                    today_totals = db.get_today_totals(uid)
+                    if not today_totals or today_totals.get('calories', 0) == 0:
+                        continue
+                    # Check if user was recently active
+                    last_msg = db.get_last_message_time(uid)
+                    if last_msg:
+                        try:
+                            last_dt = datetime.fromisoformat(last_msg)
+                            if (datetime.now() - last_dt).total_seconds() < 1800:
+                                # Active in last 30 min - skip, AI already did it
+                                continue
+                        except Exception:
+                            pass
+
+                    today_meals = db.get_today_meals(uid)
+                    activity = db.get_today_activity(uid)
+                    recent = db.get_recent_logs(uid, days=1)
+                    had_workout = bool(recent.get('workouts'))
+                    weight = db.get_latest_weight(uid)
+                    summary = await ai.generate_daily_summary(
+                        today_meals=today_meals,
+                        today_totals=today_totals,
+                        plan=plan,
+                        activity=activity,
+                        had_workout=had_workout,
+                        weight_today=weight,
+                    )
+                    await app.bot.send_message(
+                        chat_id=uid,
+                        text=summary,
+                    )
+                    db.mark_summary_done(uid, 'evening')
+                except Exception as e:
+                    logger.error(f"Evening summary {uid}: {e}")
+
+        # Send around 23:55 if user wasn't active
+        job_queue.run_daily(
+            lazy_evening_summary,
+            time=dtime(hour=23, minute=55),
+            name="evening_summary"
+        )
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("plan", show_day_plan))
+    app.add_handler(CommandHandler("week", show_week_plan))
+    app.add_handler(CommandHandler("analytics", show_analytics))
+    app.add_handler(CommandHandler("import", import_command))
+    app.add_handler(CommandHandler("import_health", import_health_command))
+    app.add_handler(CommandHandler("import_food", import_food_command))
+    app.add_handler(CommandHandler("show_data", show_data_command))
+    app.add_handler(CommandHandler("analyze", analyze_history_command))
+
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+    logger.info("Bot started!")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()
